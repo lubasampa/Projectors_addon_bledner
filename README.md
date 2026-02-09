@@ -10,16 +10,21 @@ Simple projector creation and modification for [Blender](https://www.blender.org
 * Preview the projections in Cycles render mode (Eevee will be supported when the needed functionality is implemented).
 
 ## Projectors Add-on in Action
+
 #### Throw Ratio
+Control the size of your projection by adjusting the throw ratio to match real-world projector specifications.
 ![Throw Ratio](/.github/gifs/throw_ratio.gif)
 
 #### Lens Shift
+Fine-tune the vertical and horizontal position of your projection without moving the projector itself.
 ![Lens Shift](/.github/gifs/lens_shift.gif)
 
 #### Image Textures & Resolution
+Load your own images or videos and set custom resolutions to match your projection content.
 ![Image Texture & Resolutions](/.github/gifs/image_textures_resolution.gif)
 
 #### Random Color
+Quickly assign random colors to distinguish multiple projectors in your scene.
 ![Random Color](/.github/gifs/random_color.gif)
 
 ## Note
