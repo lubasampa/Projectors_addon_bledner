@@ -9,7 +9,7 @@ type = "add-on"
 website = "https://github.com/Ocupe/Projectors"
 tags = ["Lighting", "Camera"]
 
-blender_version_min = "2.81.0"
+blender_version_min = "4.2.0"
 
 license = ["SPDX:GPL-3.0-or-later"]
 copyright = ["2024 Jonas Schell"]
