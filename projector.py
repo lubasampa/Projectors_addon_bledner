@@ -4,7 +4,8 @@ import os
 
 from enum import Enum
 import bpy
-from bpy.types import Operator
+from bpy.types import AddonPreferences, Operator, PropertyGroup
+from mathutils import Euler, Vector
 
 from .helper import (ADDON_ID, auto_offset,
                      get_projectors, get_projector, random_color)
@@ -12,6 +13,60 @@ from .helper import (ADDON_ID, auto_offset,
 logging.basicConfig(
     format='[Projectors Addon]: %(name)s - %(levelname)s - %(message)s')
 log = logging.getLogger(name=__file__)
+
+PROJECTOR_SPOT_TAG = ADDON_ID.format('spot')
+PROJECTOR_BODY_TAG = ADDON_ID.format('body')
+
+
+def _safe_register_class(cls):
+    try:
+        bpy.utils.register_class(cls)
+    except ValueError as exc:
+        # Happens on script reload when Blender still holds previous class registration.
+        if 'already registered as a subclass' not in str(exc):
+            raise
+
+
+def _safe_unregister_class(cls):
+    try:
+        bpy.utils.unregister_class(cls)
+    except RuntimeError as exc:
+        # Happens when class was not registered in this session/order.
+        if 'missing bl_rna attribute from' not in str(exc):
+            raise
+
+
+def get_projector_spot(projector):
+    if projector is None:
+        return None
+    for child in projector.children:
+        if child.get(PROJECTOR_SPOT_TAG, False):
+            return child
+    return None
+
+
+def get_projector_body(projector):
+    if projector is None:
+        return None
+    for child in projector.children:
+        if child.get(PROJECTOR_BODY_TAG, False):
+            return child
+    return None
+
+
+def get_addon_preferences(context=None):
+    addon_name = __package__
+    prefs_owner = None
+    if context is not None and getattr(context, 'preferences', None) is not None:
+        prefs_owner = context.preferences
+    elif getattr(bpy.context, 'preferences', None) is not None:
+        prefs_owner = bpy.context.preferences
+
+    if prefs_owner is None:
+        return None
+    if addon_name in prefs_owner.addons:
+        return prefs_owner.addons[addon_name].preferences
+    return None
 
 
 class Textures(Enum):
@@ -43,6 +98,55 @@ RESOLUTIONS = [
 PROJECTED_OUTPUTS = [(Textures.CHECKER.value, 'Checker', '', 1),
                      (Textures.COLOR_GRID.value, 'Color Grid', '', 2),
                      (Textures.CUSTOM_TEXTURE.value, 'Custom Texture', '', 3)]
+
+BODY_TYPES = [
+    ('NONE', 'No Body', 'Create projector without a 3D body', 1),
+    ('DEFAULT_BOX', 'Default Body', 'Create a configurable box body', 2),
+    ('SELECTED_OBJECT', 'Duplicate Active Object', 'Duplicate the active mesh object as projector body', 3),
+]
+
+
+def _saved_model_items(self, context):
+    items = [('NONE', 'None', 'No saved model', 0)]
+    prefs = get_addon_preferences(context)
+    if not prefs:
+        return items
+    for idx, item in enumerate(prefs.projector_models):
+        label = f'{item.manufacturer} - {item.model_name}'
+        items.append((str(idx), label, 'Saved projector model preset', idx + 1))
+    return items
+
+
+def _model_preset_items(self, context):
+    return _saved_model_items(self, context)
+
+
+class ProjectorModelPreset(PropertyGroup):
+    manufacturer: bpy.props.StringProperty(name='Manufacturer')
+    model_name: bpy.props.StringProperty(name='Model')
+    body_type: bpy.props.EnumProperty(name='Body Type', items=BODY_TYPES, default='DEFAULT_BOX')
+    body_dimensions: bpy.props.FloatVectorProperty(name='Body Dimensions', size=3, default=(0.35, 0.12, 0.22), min=0.01, subtype='XYZ')
+    body_offset: bpy.props.FloatVectorProperty(name='Body Offset', size=3, default=(0.0, -0.06, 0.0), subtype='TRANSLATION')
+    emitter_offset: bpy.props.FloatVectorProperty(name='Emitter Offset', size=3, default=(0.0, 0.0, 0.0), subtype='TRANSLATION')
+    emitter_rotation: bpy.props.FloatVectorProperty(name='Emitter Rotation', size=3, default=(0.0, 0.0, 0.0), subtype='EULER', unit='ROTATION')
+    power: bpy.props.FloatProperty(name='Power', default=1000.0, min=0.0, soft_max=999999.0)
+    throw_ratio: bpy.props.FloatProperty(name='Throw Ratio', default=0.8, min=0.1, soft_max=3.0)
+    h_shift: bpy.props.FloatProperty(name='Horizontal Shift', default=0.0, soft_min=-20.0, soft_max=20.0)
+    v_shift: bpy.props.FloatProperty(name='Vertical Shift', default=0.0, soft_min=-20.0, soft_max=20.0)
+
+
+class PROJECTOR_AP_preferences(AddonPreferences):
+    bl_idname = __package__
+
+    projector_models: bpy.props.CollectionProperty(type=ProjectorModelPreset)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text='Saved Projector Models')
+        if not self.projector_models:
+            layout.label(text='No saved models yet.')
+        for item in self.projector_models:
+            layout.label(text=f'{item.manufacturer} - {item.model_name}')
 
 
 class PROJECTOR_OT_change_color_randomly(Operator):
@@ -248,23 +352,159 @@ def add_projector_node_tree_to_spot(spot):
     root_tree.links.new(group.outputs[0], pixel_grid_node.inputs[1])
     root_tree.links.new(emission.outputs[0], pixel_grid_node.inputs[0])
 
+
+def _create_box_mesh(mesh_name, dimensions):
+    sx = max(dimensions[0], 0.01) * 0.5
+    sy = max(dimensions[1], 0.01) * 0.5
+    sz = max(dimensions[2], 0.01) * 0.5
+    verts = [
+        (-sx, -sy, -sz), (sx, -sy, -sz), (sx, sy, -sz), (-sx, sy, -sz),
+        (-sx, -sy, sz), (sx, -sy, sz), (sx, sy, sz), (-sx, sy, sz),
+    ]
+    faces = [
+        (0, 1, 2, 3),
+        (4, 5, 6, 7),
+        (0, 1, 5, 4),
+        (2, 3, 7, 6),
+        (1, 2, 6, 5),
+        (3, 0, 4, 7),
+    ]
+    mesh = bpy.data.meshes.new(mesh_name)
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    return mesh
+
+
+def _get_or_create_body_material():
+    mat_name = '_Projector.BodyMaterial'
+    mat = bpy.data.materials.get(mat_name)
+    if mat is None:
+        mat = bpy.data.materials.new(mat_name)
+        mat.use_nodes = True
+        bsdf = mat.node_tree.nodes.get('Principled BSDF')
+        if bsdf is not None:
+            bsdf.inputs['Base Color'].default_value = (0.17, 0.17, 0.19, 1.0)
+            bsdf.inputs['Roughness'].default_value = 0.55
+    return mat
+
+
+def _ensure_default_body(projector):
+    body = get_projector_body(projector)
+    if body and body.type == 'MESH':
+        return body
+    if body:
+        bpy.data.objects.remove(body, do_unlink=True)
+
+    settings = projector.proj_settings
+    mesh = _create_box_mesh('_Projector.BodyMesh', settings.body_dimensions)
+    body = bpy.data.objects.new('Projector.Body', mesh)
+    body[PROJECTOR_BODY_TAG] = True
+    body.parent = projector
+    body.matrix_parent_inverse.identity()
+    body.hide_render = False
+    body.hide_viewport = False
+    body.display_type = 'SOLID'
+    body.scale = (1.0, 1.0, 1.0)
+    target_collection = projector.users_collection[0] if projector.users_collection else bpy.context.scene.collection
+    target_collection.objects.link(body)
+    mat = _get_or_create_body_material()
+    if not body.data.materials:
+        body.data.materials.append(mat)
+    else:
+        body.data.materials[0] = mat
+    return body
+
+
+def _set_body_from_object(source_obj, projector):
+    if source_obj is None or source_obj.type != 'MESH':
+        raise RuntimeError('Active object must be a mesh to duplicate as projector body.')
+
+    body = source_obj.copy()
+    if source_obj.data:
+        body.data = source_obj.data.copy()
+    body.name = f'{source_obj.name}.ProjectorBody'
+    body[PROJECTOR_BODY_TAG] = True
+    body.parent = projector
+    body.matrix_parent_inverse.identity()
+    body.location = projector.proj_settings.body_offset
+    target_collection = projector.users_collection[0] if projector.users_collection else bpy.context.scene.collection
+    target_collection.objects.link(body)
+    return body
+
+
+def _apply_body(projector, proj_settings):
+    if projector is None:
+        return
+
+    body = get_projector_body(projector)
+    body_type = proj_settings.get('body_type', 'DEFAULT_BOX')
+
+    if body_type == 'NONE':
+        if body:
+            bpy.data.objects.remove(body, do_unlink=True)
+        return
+
+    if body_type == 'DEFAULT_BOX':
+        body = _ensure_default_body(projector)
+        mesh = _create_box_mesh('_Projector.BodyMesh', proj_settings.body_dimensions)
+        old_mesh = body.data
+        body.data = mesh
+        if old_mesh and old_mesh.users == 0:
+            bpy.data.meshes.remove(old_mesh, do_unlink=True)
+        mat = _get_or_create_body_material()
+        if not body.data.materials:
+            body.data.materials.append(mat)
+        else:
+            body.data.materials[0] = mat
+    elif body_type == 'SELECTED_OBJECT':
+        # Keep the currently assigned custom body if available, otherwise fallback.
+        if body is None:
+            body = _ensure_default_body(projector)
+
+    if body:
+        body.location = Vector(proj_settings.body_offset)
+        body.rotation_euler = Euler((0.0, 0.0, 0.0), 'XYZ')
+        body.hide_render = False
+        body.hide_viewport = False
+
+
+def update_body(proj_settings, context):
+    _apply_body(get_projector(context), proj_settings)
+
+
+def _apply_emitter_transform(projector, proj_settings):
+    spot = get_projector_spot(projector)
+    if spot is None:
+        return
+
+    spot.location = Vector(proj_settings.emitter_offset)
+    spot.rotation_euler = Euler(proj_settings.emitter_rotation, 'XYZ')
+
+
+def update_emitter_transform(proj_settings, context):
+    projector = get_projector(context)
+    _apply_emitter_transform(projector, proj_settings)
+
 def get_resolution(proj_settings, context):
     """ Find out what resolution is currently used and return it.
     Resolution from the dropdown or the resolution from the custom texture.
     """
     if proj_settings.use_custom_texture_res and proj_settings.projected_texture == Textures.CUSTOM_TEXTURE.value:
         projector = get_projector(context)
-        root_tree = projector.children[0].data.node_tree
-        image = root_tree.nodes['Image Texture'].image
-        if image:
-            w = image.size[0]
-            h = image.size[1]
-        else:
-            w, h = 300, 300
-    else:
-        w, h = proj_settings.resolution.split('x')
+        spot = get_projector_spot(projector)
+        if spot is None:
+            return 300.0, 300.0
+        root_tree = spot.data.node_tree
+        image_node = root_tree.nodes.get('Image Texture')
+        if image_node and image_node.image:
+            return float(image_node.image.size[0]), float(image_node.image.size[1])
+        return 300.0, 300.0
 
-    return float(w), float(h)
+    try:
+        w, h = proj_settings.resolution.split('x')
+        return float(w), float(h)
+    except Exception:
+        return 1920.0, 1080.0
 
 
 def update_throw_ratio(proj_settings, context):
@@ -272,6 +512,8 @@ def update_throw_ratio(proj_settings, context):
     Adjust some settings on a camera to achieve a throw ratio
     """
     projector = get_projector(context)
+    if projector is None:
+        return
     # Update properties of the camera.
     throw_ratio = proj_settings.get('throw_ratio')
     distance = 1
@@ -290,7 +532,9 @@ def update_throw_ratio(proj_settings, context):
     update_projected_texture(proj_settings, context)
 
     # Update spotlight properties.
-    spot = projector.children[0]
+    spot = get_projector_spot(projector)
+    if spot is None:
+        return
     nodes = spot.data.node_tree.nodes['Group'].node_tree.nodes
     if bpy.app.version < (2, 81):
         nodes['Mapping.001'].scale[0] = 1 / throw_ratio
@@ -311,6 +555,8 @@ def update_lens_shift(proj_settings, context):
     Apply the shift to the camera and texture.
     """
     projector = get_projector(context)
+    if projector is None:
+        return
     h_shift = proj_settings.get('h_shift', 0.0) / 100
     v_shift = proj_settings.get('v_shift', 0.0) / 100
     throw_ratio = proj_settings.get('throw_ratio')
@@ -324,7 +570,9 @@ def update_lens_shift(proj_settings, context):
     cam.data.shift_y = v_shift * inverted_aspect_ratio
 
     # Update spotlight node setup.
-    spot = projector.children[0]
+    spot = get_projector_spot(projector)
+    if spot is None:
+        return
     nodes = spot.data.node_tree.nodes['Group'].node_tree.nodes
     if bpy.app.version < (2, 81):
         nodes['Mapping.001'].translation[0] = h_shift / throw_ratio
@@ -336,7 +584,10 @@ def update_lens_shift(proj_settings, context):
 
 def update_resolution(proj_settings, context):
     projector = get_projector(context)
-    nodes = projector.children[0].data.node_tree.nodes['Group'].node_tree.nodes
+    spot = get_projector_spot(projector)
+    if spot is None:
+        return
+    nodes = spot.data.node_tree.nodes['Group'].node_tree.nodes
     # Change resolution image texture
     nodes['Image Texture'].image = bpy.data.images[f'_proj.tex.{proj_settings.resolution}']
     update_throw_ratio(proj_settings, context)
@@ -345,21 +596,29 @@ def update_resolution(proj_settings, context):
 
 def update_checker_color(proj_settings, context):
     # Update checker texture color
-    nodes = get_projector(
-        context).children[0].data.node_tree.nodes['Group'].node_tree.nodes
+    projector = get_projector(context)
+    spot = get_projector_spot(projector)
+    if spot is None:
+        return
+    nodes = spot.data.node_tree.nodes['Group'].node_tree.nodes
     c = proj_settings.projected_color
     nodes['Checker Texture'].inputs['Color2'].default_value = [c.r, c.g, c.b, 1]
 
 
 def update_power(proj_settings, context):
     # Update spotlight power
-    spot = get_projector(context).children[0]
+    spot = get_projector_spot(get_projector(context))
+    if spot is None:
+        return
     spot.data.energy = proj_settings["power"]
 
 
 def update_pixel_grid(proj_settings, context):
     """ Update the pixel grid. Meaning, make it visible by linking the right node and updating the resolution. """
-    root_tree = get_projector(context).children[0].data.node_tree
+    spot = get_projector_spot(get_projector(context))
+    if spot is None:
+        return
+    root_tree = spot.data.node_tree
     nodes = root_tree.nodes
     pixel_grid_nodes = nodes['pixel_grid'].node_tree.nodes
     width, height = get_resolution(proj_settings, context)
@@ -500,7 +759,7 @@ def create_projector(context):
     spot.data.spot_blend = 0
     spot.data.shadow_soft_size = 0.0
     spot.hide_select = True
-    spot[ADDON_ID.format('spot')] = True
+    spot[PROJECTOR_SPOT_TAG] = True
     spot.data.cycles.use_multiple_importance_sampling = False
     add_projector_node_tree_to_spot(spot)
 
@@ -530,6 +789,11 @@ def init_projector(proj_settings, context):
     proj_settings.projected_color = random_color()
     proj_settings.resolution = '1920x1080'
     proj_settings.use_custom_texture_res = True
+    proj_settings.body_type = 'DEFAULT_BOX'
+    proj_settings.body_dimensions = (0.35, 0.12, 0.22)
+    proj_settings.body_offset = (0.0, -0.06, 0.0)
+    proj_settings.emitter_offset = (0.0, 0.0, 0.0)
+    proj_settings.emitter_rotation = (0.0, 0.0, 0.0)
 
     # Init Projector
     update_throw_ratio(proj_settings, context)
@@ -539,6 +803,57 @@ def init_projector(proj_settings, context):
     update_lens_shift(proj_settings, context)
     update_power(proj_settings, context)
     update_pixel_grid(proj_settings, context)
+    update_emitter_transform(proj_settings, context)
+    update_body(proj_settings, context)
+
+
+def _apply_model_to_projector(projector, model_data):
+    settings = projector.proj_settings
+    settings.throw_ratio = model_data['throw_ratio']
+    settings.power = model_data['power']
+    settings.h_shift = model_data['h_shift']
+    settings.v_shift = model_data['v_shift']
+    settings.body_type = model_data['body_type']
+    settings.body_dimensions = model_data['body_dimensions']
+    settings.body_offset = model_data['body_offset']
+    settings.emitter_offset = model_data['emitter_offset']
+    settings.emitter_rotation = model_data['emitter_rotation']
+
+
+def _store_model_preset_from_data(manufacturer, model_name, model_data):
+    prefs = get_addon_preferences()
+    if prefs is None:
+        return False
+
+    manufacturer = manufacturer.strip()
+    model_name = model_name.strip()
+    if not manufacturer or not model_name:
+        return False
+
+    # Overwrite existing same name.
+    existing_idx = -1
+    for idx, item in enumerate(prefs.projector_models):
+        if item.manufacturer == manufacturer and item.model_name == model_name:
+            existing_idx = idx
+            break
+
+    if existing_idx >= 0:
+        preset = prefs.projector_models[existing_idx]
+    else:
+        preset = prefs.projector_models.add()
+
+    preset.manufacturer = manufacturer
+    preset.model_name = model_name
+    preset.body_type = model_data['body_type']
+    preset.body_dimensions = model_data['body_dimensions']
+    preset.body_offset = model_data['body_offset']
+    preset.emitter_offset = model_data['emitter_offset']
+    preset.emitter_rotation = model_data['emitter_rotation']
+    preset.power = model_data['power']
+    preset.throw_ratio = model_data['throw_ratio']
+    preset.h_shift = model_data['h_shift']
+    preset.v_shift = model_data['v_shift']
+    return True
 
 
 class PROJECTOR_OT_create_projector(Operator):
@@ -547,20 +862,279 @@ class PROJECTOR_OT_create_projector(Operator):
     bl_label = 'Create a new Projector'
     bl_options = {'REGISTER', 'UNDO'}
 
+    body_type: bpy.props.EnumProperty(name='Body', items=BODY_TYPES, default='DEFAULT_BOX')
+    body_x: bpy.props.FloatProperty(name='Length', default=0.35, min=0.01, subtype='DISTANCE')
+    body_y: bpy.props.FloatProperty(name='Depth', default=0.12, min=0.01, subtype='DISTANCE')
+    body_z: bpy.props.FloatProperty(name='Height', default=0.22, min=0.01, subtype='DISTANCE')
+    body_offset: bpy.props.FloatVectorProperty(name='Body Offset', size=3, default=(0.0, -0.06, 0.0), subtype='TRANSLATION')
+    emitter_offset: bpy.props.FloatVectorProperty(name='Emitter Offset', size=3, default=(0.0, 0.0, 0.0), subtype='TRANSLATION')
+    emitter_rotation: bpy.props.FloatVectorProperty(name='Emitter Rotation', size=3, default=(0.0, 0.0, 0.0), subtype='EULER', unit='ROTATION')
+
+    power: bpy.props.FloatProperty(name='Power', default=1000.0, min=0.0, soft_max=999999.0)
+    throw_ratio: bpy.props.FloatProperty(name='Throw Ratio', default=0.8, min=0.1, soft_max=3.0)
+    h_shift: bpy.props.FloatProperty(name='Horizontal Shift', default=0.0, soft_min=-20.0, soft_max=20.0, subtype='PERCENTAGE')
+    v_shift: bpy.props.FloatProperty(name='Vertical Shift', default=0.0, soft_min=-20.0, soft_max=20.0, subtype='PERCENTAGE')
+
+    use_saved_model: bpy.props.BoolProperty(name='Use Saved Model', default=False)
+    saved_model: bpy.props.EnumProperty(name='Saved Model', items=_model_preset_items)
+
     @classmethod
     def poll(cls, context):
         return context.mode == 'OBJECT'
 
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        layout.prop(self, 'use_saved_model')
+        if self.use_saved_model:
+            layout.prop(self, 'saved_model')
+
+        box = layout.box()
+        box.label(text='Body')
+        box.prop(self, 'body_type')
+        if self.body_type == 'DEFAULT_BOX':
+            row = box.row(align=True)
+            row.prop(self, 'body_x')
+            row.prop(self, 'body_y')
+            row.prop(self, 'body_z')
+        box.prop(self, 'body_offset')
+
+        beam = layout.box()
+        beam.label(text='Beam Origin and Direction')
+        beam.prop(self, 'emitter_offset')
+        beam.prop(self, 'emitter_rotation')
+
+        proj = layout.box()
+        proj.label(text='Projector Settings')
+        proj.prop(self, 'power')
+        proj.prop(self, 'throw_ratio')
+        proj.prop(self, 'h_shift')
+        proj.prop(self, 'v_shift')
+
     def execute(self, context):
+        source_body_obj = context.view_layer.objects.active
         projector = create_projector(context)
         init_projector(projector.proj_settings, context)
+
+        model_data = None
+        if self.use_saved_model and self.saved_model != 'NONE':
+            prefs = get_addon_preferences()
+            if prefs is not None:
+                try:
+                    preset = prefs.projector_models[int(self.saved_model)]
+                    model_data = {
+                        'body_type': preset.body_type,
+                        'body_dimensions': tuple(preset.body_dimensions),
+                        'body_offset': tuple(preset.body_offset),
+                        'emitter_offset': tuple(preset.emitter_offset),
+                        'emitter_rotation': tuple(preset.emitter_rotation),
+                        'power': preset.power,
+                        'throw_ratio': preset.throw_ratio,
+                        'h_shift': preset.h_shift,
+                        'v_shift': preset.v_shift,
+                    }
+                except (ValueError, IndexError):
+                    pass
+
+        if model_data is None:
+            model_data = {
+                'body_type': self.body_type,
+                'body_dimensions': (self.body_x, self.body_y, self.body_z),
+                'body_offset': tuple(self.body_offset),
+                'emitter_offset': tuple(self.emitter_offset),
+                'emitter_rotation': tuple(self.emitter_rotation),
+                'power': self.power,
+                'throw_ratio': self.throw_ratio,
+                'h_shift': self.h_shift,
+                'v_shift': self.v_shift,
+            }
+
+        _apply_model_to_projector(projector, model_data)
+
+        if model_data['body_type'] == 'SELECTED_OBJECT':
+            try:
+                existing_body = get_projector_body(projector)
+                if existing_body is not None:
+                    old_mesh = existing_body.data
+                    bpy.data.objects.remove(existing_body, do_unlink=True)
+                    if old_mesh and old_mesh.users == 0:
+                        bpy.data.meshes.remove(old_mesh, do_unlink=True)
+                body = _set_body_from_object(source_body_obj, projector)
+                body.location = Vector(model_data['body_offset'])
+            except RuntimeError as exc:
+                self.report({'WARNING'}, f'{exc} Using default body instead.')
+                projector.proj_settings.body_type = 'DEFAULT_BOX'
+                _apply_body(projector, projector.proj_settings)
+        else:
+            _apply_body(projector, projector.proj_settings)
+
+        _apply_emitter_transform(projector, projector.proj_settings)
+        if projector.proj_settings.body_type == 'DEFAULT_BOX' and get_projector_body(projector) is None:
+            _ensure_default_body(projector)
+            _apply_body(projector, projector.proj_settings)
         return {'FINISHED'}
+
+
+def _model_data_from_settings(settings):
+    return {
+        'body_type': settings.body_type,
+        'body_dimensions': tuple(settings.body_dimensions),
+        'body_offset': tuple(settings.body_offset),
+        'emitter_offset': tuple(settings.emitter_offset),
+        'emitter_rotation': tuple(settings.emitter_rotation),
+        'power': settings.power,
+        'throw_ratio': settings.throw_ratio,
+        'h_shift': settings.h_shift,
+        'v_shift': settings.v_shift,
+    }
+
+
+class PROJECTOR_OT_apply_saved_model(Operator):
+    bl_idname = 'projector.apply_saved_model'
+    bl_label = 'Apply Saved Model'
+    bl_options = {'REGISTER', 'UNDO'}
+    saved_model: bpy.props.EnumProperty(name='Saved Model', items=_saved_model_items, default='NONE')
+
+    @classmethod
+    def poll(cls, context):
+        return get_projector(context) is not None
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        layout.prop(self, 'saved_model')
+
+    def execute(self, context):
+        projector = get_projector(context)
+        if projector is None:
+            return {'CANCELLED'}
+
+        model_key = self.saved_model
+        if model_key == 'NONE':
+            self.report({'WARNING'}, 'Select a saved model first.')
+            return {'CANCELLED'}
+
+        prefs = get_addon_preferences()
+        if prefs is None:
+            return {'CANCELLED'}
+
+        try:
+            preset = prefs.projector_models[int(model_key)]
+        except (ValueError, IndexError):
+            self.report({'ERROR'}, 'Saved model not found.')
+            return {'CANCELLED'}
+
+        model_data = {
+            'body_type': preset.body_type,
+            'body_dimensions': tuple(preset.body_dimensions),
+            'body_offset': tuple(preset.body_offset),
+            'emitter_offset': tuple(preset.emitter_offset),
+            'emitter_rotation': tuple(preset.emitter_rotation),
+            'power': preset.power,
+            'throw_ratio': preset.throw_ratio,
+            'h_shift': preset.h_shift,
+            'v_shift': preset.v_shift,
+        }
+        _apply_model_to_projector(projector, model_data)
+        _apply_body(projector, projector.proj_settings)
+        _apply_emitter_transform(projector, projector.proj_settings)
+        self.report({'INFO'}, f'Applied model: {preset.manufacturer} - {preset.model_name}')
+        return {'FINISHED'}
+
+
+class PROJECTOR_OT_save_model_from_selected(Operator):
+    bl_idname = 'projector.save_model_from_selected'
+    bl_label = 'Save Current as Model'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    manufacturer: bpy.props.StringProperty(name='Manufacturer', default='')
+    model_name: bpy.props.StringProperty(name='Model', default='')
+
+    @classmethod
+    def poll(cls, context):
+        return get_projector(context) is not None
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        layout.prop(self, 'manufacturer')
+        layout.prop(self, 'model_name')
+
+    def execute(self, context):
+        projector = get_projector(context)
+        if projector is None:
+            return {'CANCELLED'}
+        model_data = _model_data_from_settings(projector.proj_settings)
+        if _store_model_preset_from_data(self.manufacturer, self.model_name, model_data):
+            self.report({'INFO'}, f'Saved model {self.manufacturer} - {self.model_name}')
+            return {'FINISHED'}
+        self.report({'WARNING'}, 'Model not saved. Fill manufacturer and model name.')
+        return {'CANCELLED'}
+
+
+class PROJECTOR_OT_delete_saved_model(Operator):
+    bl_idname = 'projector.delete_saved_model'
+    bl_label = 'Delete Saved Model'
+    bl_options = {'REGISTER', 'UNDO'}
+    saved_model: bpy.props.EnumProperty(name='Saved Model', items=_saved_model_items, default='NONE')
+
+    @classmethod
+    def poll(cls, context):
+        prefs = get_addon_preferences()
+        return prefs is not None and len(prefs.projector_models) > 0
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        layout.prop(self, 'saved_model')
+
+    def execute(self, context):
+        model_key = self.saved_model
+        if model_key == 'NONE':
+            self.report({'WARNING'}, 'Select a saved model to delete.')
+            return {'CANCELLED'}
+
+        prefs = get_addon_preferences()
+        if prefs is None:
+            return {'CANCELLED'}
+
+        try:
+            idx = int(model_key)
+            label = f'{prefs.projector_models[idx].manufacturer} - {prefs.projector_models[idx].model_name}'
+            prefs.projector_models.remove(idx)
+            self.report({'INFO'}, f'Deleted model: {label}')
+            return {'FINISHED'}
+        except (ValueError, IndexError):
+            self.report({'ERROR'}, 'Saved model not found.')
+            return {'CANCELLED'}
 
 
 def update_projected_texture(proj_settings, context):
     """ Update the projected output source. """
-    projector = get_projectors(context, only_selected=True)[0]
-    root_tree = projector.children[0].data.node_tree
+    projector = get_projector(context)
+    if projector is None:
+        return
+    spot = get_projector_spot(projector)
+    if spot is None:
+        return
+    root_tree = spot.data.node_tree
     group_tree = root_tree.nodes['Group'].node_tree
     group_output_node = group_tree.nodes['Group Output']
     group_node = root_tree.nodes['Group']
@@ -649,19 +1223,62 @@ class ProjectorSettings(bpy.types.PropertyGroup):
         description="When checked the image is divided into a pixel grid with the dimensions of the image resolution.",
         default=False,
         update=update_pixel_grid)
+    body_type: bpy.props.EnumProperty(
+        name='Body Type',
+        items=BODY_TYPES,
+        default='DEFAULT_BOX',
+        update=update_body)
+    body_dimensions: bpy.props.FloatVectorProperty(
+        name='Body Dimensions',
+        size=3,
+        default=(0.35, 0.12, 0.22),
+        min=0.01,
+        subtype='XYZ',
+        update=update_body)
+    body_offset: bpy.props.FloatVectorProperty(
+        name='Body Offset',
+        size=3,
+        default=(0.0, -0.06, 0.0),
+        subtype='TRANSLATION',
+        update=update_body)
+    emitter_offset: bpy.props.FloatVectorProperty(
+        name='Emitter Offset',
+        size=3,
+        default=(0.0, 0.0, 0.0),
+        subtype='TRANSLATION',
+        update=update_emitter_transform)
+    emitter_rotation: bpy.props.FloatVectorProperty(
+        name='Emitter Rotation',
+        size=3,
+        default=(0.0, 0.0, 0.0),
+        subtype='EULER',
+        unit='ROTATION',
+        update=update_emitter_transform)
 
 
 def register():
-    bpy.utils.register_class(ProjectorSettings)
-    bpy.utils.register_class(PROJECTOR_OT_create_projector)
-    bpy.utils.register_class(PROJECTOR_OT_delete_projector)
-    bpy.utils.register_class(PROJECTOR_OT_change_color_randomly)
+    _safe_register_class(ProjectorModelPreset)
+    _safe_register_class(PROJECTOR_AP_preferences)
+    _safe_register_class(ProjectorSettings)
+    _safe_register_class(PROJECTOR_OT_create_projector)
+    _safe_register_class(PROJECTOR_OT_apply_saved_model)
+    _safe_register_class(PROJECTOR_OT_save_model_from_selected)
+    _safe_register_class(PROJECTOR_OT_delete_saved_model)
+    _safe_register_class(PROJECTOR_OT_delete_projector)
+    _safe_register_class(PROJECTOR_OT_change_color_randomly)
     bpy.types.Object.proj_settings = bpy.props.PointerProperty(
         type=ProjectorSettings)
 
 
 def unregister():
-    bpy.utils.unregister_class(PROJECTOR_OT_change_color_randomly)
-    bpy.utils.unregister_class(PROJECTOR_OT_delete_projector)
-    bpy.utils.unregister_class(PROJECTOR_OT_create_projector)
-    bpy.utils.unregister_class(ProjectorSettings)
+    if hasattr(bpy.types.Object, 'proj_settings'):
+        del bpy.types.Object.proj_settings
+    _safe_unregister_class(PROJECTOR_OT_change_color_randomly)
+    _safe_unregister_class(PROJECTOR_OT_delete_projector)
+    _safe_unregister_class(PROJECTOR_OT_delete_saved_model)
+    _safe_unregister_class(PROJECTOR_OT_save_model_from_selected)
+    _safe_unregister_class(PROJECTOR_OT_apply_saved_model)
+    _safe_unregister_class(PROJECTOR_OT_create_projector)
+    _safe_unregister_class(ProjectorSettings)
+    _safe_unregister_class(PROJECTOR_AP_preferences)
+    _safe_unregister_class(ProjectorModelPreset)

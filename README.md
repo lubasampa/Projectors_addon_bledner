@@ -27,6 +27,20 @@ Load your own images or videos and set custom resolutions to match your projecti
 Quickly assign random colors to distinguish multiple projectors in your scene.
 ![Random Color](/.github/gifs/random_color.gif)
 
+## Projector Body and Saved Models
+When creating a projector (`New`), the add-on opens a setup dialog where you can:
+* Choose body type:
+  * `No Body`
+  * `Default Body` (parametric box with length/depth/height)
+  * `Duplicate Active Object` (uses current active mesh as projector body copy)
+* Set beam origin and direction:
+  * `Emitter Offset` (where the projection starts from the body)
+  * `Emitter Rotation` (beam direction in local coordinates)
+* Save/reuse/delete projector models after projector creation:
+  * Use `Saved Models` section in the projector panel
+  * Save current setup with `Manufacturer` + `Model`
+  * Apply or delete saved models later
+
 ## Note
 * works with Blender 2.8 and up
 

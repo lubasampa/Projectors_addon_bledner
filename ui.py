@@ -1,5 +1,5 @@
 from .helper import get_projectors
-from .projector import RESOLUTIONS, Textures
+from .projector import RESOLUTIONS, Textures, get_projector_spot
 
 import bpy
 from bpy.types import Panel, PropertyGroup, UIList, Operator
@@ -58,13 +58,34 @@ class PROJECTOR_PT_projector_settings(Panel):
             # Pixel Grid
             box.prop(proj_settings, 'show_pixel_grid')
 
+            layout.separator()
+            layout.label(text='Projector Body:')
+            body_box = layout.box()
+            body_box.prop(proj_settings, 'body_type', text='Body')
+            if proj_settings.body_type == 'DEFAULT_BOX':
+                row = body_box.row(align=True)
+                row.prop(proj_settings, 'body_dimensions', text='Size')
+            body_box.prop(proj_settings, 'body_offset')
+            body_box.prop(proj_settings, 'emitter_offset')
+            body_box.prop(proj_settings, 'emitter_rotation')
+
+            layout.separator()
+            layout.label(text='Saved Models:')
+            model_box = layout.box()
+            row = model_box.row(align=True)
+            row.operator('projector.apply_saved_model', text='Apply')
+            row.operator('projector.delete_saved_model', text='Delete')
+            model_box.operator('projector.save_model_from_selected', text='Save Current')
+
             # Custom Texture
             if proj_settings.projected_texture == Textures.CUSTOM_TEXTURE.value:
                 box = layout.box()
                 box.prop(proj_settings, 'use_custom_texture_res')
-                node = get_projectors(context, only_selected=True)[
-                    0].children[0].data.node_tree.nodes['Image Texture']
-                box.template_image(node, 'image', node.image_user, compact=False)
+                projector = get_projectors(context, only_selected=True)[0]
+                spot = get_projector_spot(projector)
+                if spot:
+                    node = spot.data.node_tree.nodes['Image Texture']
+                    box.template_image(node, 'image', node.image_user, compact=False)
 
 
 class PROJECTOR_PT_projected_color(Panel):
