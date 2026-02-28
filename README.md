@@ -36,6 +36,10 @@ When creating a projector (`New`), the add-on opens a setup dialog where you can
 * Set beam origin and direction:
   * `Emitter Offset` (where the projection starts from the body)
   * `Emitter Rotation` (beam direction in local coordinates)
+* Projection cone preview:
+  * `Show Projection Cone` creates a frustum preview that follows throw ratio, lens shift and aspect ratio
+  * `Cone Length` controls only the cone depth
+  * While cone is enabled, projector spot light is disabled; disabling cone restores spot light
 * Save/reuse/delete projector models after projector creation:
   * Use `Saved Models` section in the projector panel
   * Save current setup with `Manufacturer` + `Model`

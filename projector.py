@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import json
 
 from enum import Enum
 import bpy
@@ -16,6 +17,7 @@ log = logging.getLogger(name=__file__)
 
 PROJECTOR_SPOT_TAG = ADDON_ID.format('spot')
 PROJECTOR_BODY_TAG = ADDON_ID.format('body')
+PROJECTOR_CONE_TAG = ADDON_ID.format('projection_cone')
 
 
 def _safe_register_class(cls):
@@ -25,6 +27,11 @@ def _safe_register_class(cls):
         # Happens on script reload when Blender still holds previous class registration.
         if 'already registered as a subclass' not in str(exc):
             raise
+        try:
+            bpy.utils.unregister_class(cls)
+        except RuntimeError:
+            pass
+        bpy.utils.register_class(cls)
 
 
 def _safe_unregister_class(cls):
@@ -52,6 +59,37 @@ def get_projector_body(projector):
         if child.get(PROJECTOR_BODY_TAG, False):
             return child
     return None
+
+
+def get_projector_cone(projector):
+    if projector is None:
+        return None
+    # Cone is parented to the spot light (grandchild of projector), so scan recursively.
+    stack = list(projector.children)
+    while stack:
+        child = stack.pop()
+        if child.get(PROJECTOR_CONE_TAG, False):
+            return child
+        stack.extend(child.children)
+    return None
+
+
+def _remove_all_projector_cones(projector):
+    if projector is None:
+        return
+    stack = list(projector.children)
+    to_remove = []
+    while stack:
+        child = stack.pop()
+        if child.get(PROJECTOR_CONE_TAG, False):
+            to_remove.append(child)
+        stack.extend(child.children)
+
+    for cone in to_remove:
+        old_mesh = cone.data
+        bpy.data.objects.remove(cone, do_unlink=True)
+        if old_mesh and old_mesh.users == 0:
+            bpy.data.meshes.remove(old_mesh, do_unlink=True)
 
 
 def get_addon_preferences(context=None):
@@ -127,12 +165,17 @@ class ProjectorModelPreset(PropertyGroup):
     body_type: bpy.props.EnumProperty(name='Body Type', items=BODY_TYPES, default='DEFAULT_BOX')
     body_dimensions: bpy.props.FloatVectorProperty(name='Body Dimensions', size=3, default=(0.35, 0.12, 0.22), min=0.01, subtype='XYZ')
     body_offset: bpy.props.FloatVectorProperty(name='Body Offset', size=3, default=(0.0, -0.06, 0.0), subtype='TRANSLATION')
+    body_rotation: bpy.props.FloatVectorProperty(name='Body Rotation', size=3, default=(0.0, 0.0, 0.0), subtype='EULER', unit='ROTATION')
     emitter_offset: bpy.props.FloatVectorProperty(name='Emitter Offset', size=3, default=(0.0, 0.0, 0.0), subtype='TRANSLATION')
     emitter_rotation: bpy.props.FloatVectorProperty(name='Emitter Rotation', size=3, default=(0.0, 0.0, 0.0), subtype='EULER', unit='ROTATION')
     power: bpy.props.FloatProperty(name='Power', default=1000.0, min=0.0, soft_max=999999.0)
     throw_ratio: bpy.props.FloatProperty(name='Throw Ratio', default=0.8, min=0.1, soft_max=3.0)
     h_shift: bpy.props.FloatProperty(name='Horizontal Shift', default=0.0, soft_min=-20.0, soft_max=20.0)
     v_shift: bpy.props.FloatProperty(name='Vertical Shift', default=0.0, soft_min=-20.0, soft_max=20.0)
+    projection_cone_enabled: bpy.props.BoolProperty(name='Projection Cone', default=False)
+    projection_cone_length: bpy.props.FloatProperty(name='Cone Length (m)', default=0.0, min=0.0)
+    body_mesh_vertices_json: bpy.props.StringProperty(name='Body Mesh Vertices', default='')
+    body_mesh_faces_json: bpy.props.StringProperty(name='Body Mesh Faces', default='')
 
 
 class PROJECTOR_AP_preferences(AddonPreferences):
@@ -432,6 +475,45 @@ def _set_body_from_object(source_obj, projector):
     return body
 
 
+def _serialize_mesh_data(obj):
+    if obj is None or obj.type != 'MESH' or obj.data is None:
+        return '', ''
+    mesh = obj.data
+    vertices = [[float(v.co.x), float(v.co.y), float(v.co.z)] for v in mesh.vertices]
+    faces = [list(p.vertices) for p in mesh.polygons if len(p.vertices) >= 3]
+    if not vertices or not faces:
+        return '', ''
+    return json.dumps(vertices), json.dumps(faces)
+
+
+def _create_body_from_mesh_data(projector, vertices_json, faces_json):
+    if not vertices_json or not faces_json:
+        return None
+    try:
+        vertices = json.loads(vertices_json)
+        faces = json.loads(faces_json)
+    except Exception:
+        return None
+    if not vertices or not faces:
+        return None
+
+    mesh = bpy.data.meshes.new('_Projector.BodyMesh.Template')
+    mesh.from_pydata(vertices, [], faces)
+    mesh.update()
+    body = bpy.data.objects.new('Projector.Body', mesh)
+    body[PROJECTOR_BODY_TAG] = True
+    body.parent = projector
+    body.matrix_parent_inverse.identity()
+    body.hide_render = False
+    body.hide_viewport = False
+    body.display_type = 'SOLID'
+    target_collection = projector.users_collection[0] if projector.users_collection else bpy.context.scene.collection
+    target_collection.objects.link(body)
+    mat = _get_or_create_body_material()
+    body.data.materials.append(mat)
+    return body
+
+
 def _apply_body(projector, proj_settings):
     if projector is None:
         return
@@ -463,7 +545,7 @@ def _apply_body(projector, proj_settings):
 
     if body:
         body.location = Vector(proj_settings.body_offset)
-        body.rotation_euler = Euler((0.0, 0.0, 0.0), 'XYZ')
+        body.rotation_euler = Euler(proj_settings.body_rotation, 'XYZ')
         body.hide_render = False
         body.hide_viewport = False
 
@@ -484,13 +566,136 @@ def _apply_emitter_transform(projector, proj_settings):
 def update_emitter_transform(proj_settings, context):
     projector = get_projector(context)
     _apply_emitter_transform(projector, proj_settings)
+    _apply_projection_cone(projector, proj_settings)
 
-def get_resolution(proj_settings, context):
-    """ Find out what resolution is currently used and return it.
-    Resolution from the dropdown or the resolution from the custom texture.
-    """
+
+def _create_projection_cone_mesh(name, width, height, shift_x, shift_y, length):
+    half_w = max(width * 0.5, 0.01)
+    half_h = max(height * 0.5, 0.01)
+    length = max(length, 0.2)
+    verts = [
+        (0.0, 0.0, 0.0),
+        (-half_w + shift_x, -half_h + shift_y, -length),
+        (half_w + shift_x, -half_h + shift_y, -length),
+        (half_w + shift_x, half_h + shift_y, -length),
+        (-half_w + shift_x, half_h + shift_y, -length),
+    ]
+    faces = [(0, 1, 2), (0, 2, 3), (0, 3, 4), (0, 4, 1), (4, 3, 2, 1)]
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    return mesh
+
+
+def _meters_to_scene_units(value_m, scene=None):
+    scene = scene or bpy.context.scene
+    scale = 1.0
+    if scene is not None and scene.unit_settings is not None:
+        scale = scene.unit_settings.scale_length if scene.unit_settings.scale_length > 0 else 1.0
+    return value_m / scale
+
+
+def _get_or_create_cone_material():
+    mat = bpy.data.materials.get('_Projector.ConeMaterial')
+    if mat is None:
+        mat = bpy.data.materials.new('_Projector.ConeMaterial')
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+
+    out = nodes.new('ShaderNodeOutputMaterial')
+    bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+    bsdf.inputs['Base Color'].default_value = (0.45, 0.72, 1.0, 1.0)
+    bsdf.inputs['Alpha'].default_value = 0.25
+    bsdf.inputs['Roughness'].default_value = 0.35
+    links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
+
+    mat.blend_method = 'BLEND'
+    if hasattr(mat, 'shadow_method'):
+        mat.shadow_method = 'NONE'
+    return mat
+
+
+def _set_spot_enabled(projector, enabled):
+    spot = get_projector_spot(projector)
+    if spot is None:
+        return
+    spot.data.energy = projector.proj_settings.power if enabled else 0.0
+
+
+def _apply_projection_cone(projector, proj_settings):
+    if projector is None:
+        return
+
+    cone = get_projector_cone(projector)
+    if not proj_settings.projection_cone_enabled:
+        _remove_all_projector_cones(projector)
+        _set_spot_enabled(projector, True)
+        return
+
+    res_w, res_h = _get_resolution_for_projector(projector, proj_settings)
+    aspect = max(res_w / max(res_h, 1.0), 0.01)
+    throw_ratio = max(proj_settings.throw_ratio, 0.1)
+    length_m = max(proj_settings.projection_cone_length, 0.0)
+    if length_m <= 0.0:
+        _remove_all_projector_cones(projector)
+        _set_spot_enabled(projector, False)
+        return
+    length = _meters_to_scene_units(length_m)
+    width = length / throw_ratio
+    height = width / aspect
+    shift_x = (proj_settings.h_shift / 100.0) * width
+    shift_y = (proj_settings.v_shift / 100.0) * height
+    mesh = _create_projection_cone_mesh(
+        '_Projector.ConeMesh',
+        width=width,
+        height=height,
+        shift_x=shift_x,
+        shift_y=shift_y,
+        length=length,
+    )
+
+    spot = get_projector_spot(projector)
+    if spot is None:
+        return
+
+    if cone is None:
+        cone = bpy.data.objects.new('Projector.Cone', mesh)
+        cone[PROJECTOR_CONE_TAG] = True
+        cone.parent = spot
+        cone.matrix_parent_inverse.identity()
+        target_collection = projector.users_collection[0] if projector.users_collection else bpy.context.scene.collection
+        target_collection.objects.link(cone)
+    else:
+        # Clean up any duplicated old cones and keep a single active one.
+        _remove_all_projector_cones(projector)
+        cone = bpy.data.objects.new('Projector.Cone', mesh)
+        cone[PROJECTOR_CONE_TAG] = True
+        cone.parent = spot
+        cone.matrix_parent_inverse.identity()
+        target_collection = projector.users_collection[0] if projector.users_collection else bpy.context.scene.collection
+        target_collection.objects.link(cone)
+
+    cone.location = (0.0, 0.0, 0.0)
+    cone.rotation_euler = Euler((0.0, 0.0, 0.0), 'XYZ')
+    cone.hide_render = False
+    cone.hide_viewport = False
+    cone.hide_select = True
+    cone.display_type = 'TEXTURED'
+    mat = _get_or_create_cone_material()
+    if not cone.data.materials:
+        cone.data.materials.append(mat)
+    else:
+        cone.data.materials[0] = mat
+    _set_spot_enabled(projector, False)
+
+
+def update_projection_cone(proj_settings, context):
+    _apply_projection_cone(get_projector(context), proj_settings)
+
+def _get_resolution_for_projector(projector, proj_settings):
     if proj_settings.use_custom_texture_res and proj_settings.projected_texture == Textures.CUSTOM_TEXTURE.value:
-        projector = get_projector(context)
         spot = get_projector_spot(projector)
         if spot is None:
             return 300.0, 300.0
@@ -505,6 +710,13 @@ def get_resolution(proj_settings, context):
         return float(w), float(h)
     except Exception:
         return 1920.0, 1080.0
+
+
+def get_resolution(proj_settings, context):
+    """ Find out what resolution is currently used and return it.
+    Resolution from the dropdown or the resolution from the custom texture.
+    """
+    return _get_resolution_for_projector(get_projector(context), proj_settings)
 
 
 def update_throw_ratio(proj_settings, context):
@@ -546,6 +758,7 @@ def update_throw_ratio(proj_settings, context):
 
     # Update lens shift because it depends on the throw ratio.
     update_lens_shift(proj_settings, context)
+    update_projection_cone(proj_settings, context)
 
     
 
@@ -580,6 +793,7 @@ def update_lens_shift(proj_settings, context):
     else:
         nodes['Mapping.001'].inputs[1].default_value[0] = h_shift / throw_ratio
         nodes['Mapping.001'].inputs[1].default_value[1] = v_shift / throw_ratio * inverted_aspect_ratio
+    update_projection_cone(proj_settings, context)
 
 
 def update_resolution(proj_settings, context):
@@ -592,6 +806,7 @@ def update_resolution(proj_settings, context):
     nodes['Image Texture'].image = bpy.data.images[f'_proj.tex.{proj_settings.resolution}']
     update_throw_ratio(proj_settings, context)
     update_pixel_grid(proj_settings, context)
+    update_projection_cone(proj_settings, context)
 
 
 def update_checker_color(proj_settings, context):
@@ -606,11 +821,14 @@ def update_checker_color(proj_settings, context):
 
 
 def update_power(proj_settings, context):
-    # Update spotlight power
-    spot = get_projector_spot(get_projector(context))
-    if spot is None:
+    projector = get_projector(context)
+    spot = get_projector_spot(projector)
+    if spot is None or projector is None:
         return
-    spot.data.energy = proj_settings["power"]
+    if proj_settings.projection_cone_enabled:
+        spot.data.energy = 0.0
+    else:
+        spot.data.energy = proj_settings["power"]
 
 
 def update_pixel_grid(proj_settings, context):
@@ -792,8 +1010,11 @@ def init_projector(proj_settings, context):
     proj_settings.body_type = 'DEFAULT_BOX'
     proj_settings.body_dimensions = (0.35, 0.12, 0.22)
     proj_settings.body_offset = (0.0, -0.06, 0.0)
+    proj_settings.body_rotation = (0.0, 0.0, 0.0)
     proj_settings.emitter_offset = (0.0, 0.0, 0.0)
     proj_settings.emitter_rotation = (0.0, 0.0, 0.0)
+    proj_settings.projection_cone_enabled = False
+    proj_settings.projection_cone_length = 3.0
 
     # Init Projector
     update_throw_ratio(proj_settings, context)
@@ -805,6 +1026,7 @@ def init_projector(proj_settings, context):
     update_pixel_grid(proj_settings, context)
     update_emitter_transform(proj_settings, context)
     update_body(proj_settings, context)
+    update_projection_cone(proj_settings, context)
 
 
 def _apply_model_to_projector(projector, model_data):
@@ -813,9 +1035,12 @@ def _apply_model_to_projector(projector, model_data):
     settings.power = model_data['power']
     settings.h_shift = model_data['h_shift']
     settings.v_shift = model_data['v_shift']
+    settings.projection_cone_enabled = model_data.get('projection_cone_enabled', False)
+    settings.projection_cone_length = model_data.get('projection_cone_length', 3.0)
     settings.body_type = model_data['body_type']
     settings.body_dimensions = model_data['body_dimensions']
     settings.body_offset = model_data['body_offset']
+    settings.body_rotation = model_data.get('body_rotation', (0.0, 0.0, 0.0))
     settings.emitter_offset = model_data['emitter_offset']
     settings.emitter_rotation = model_data['emitter_rotation']
 
@@ -847,12 +1072,17 @@ def _store_model_preset_from_data(manufacturer, model_name, model_data):
     preset.body_type = model_data['body_type']
     preset.body_dimensions = model_data['body_dimensions']
     preset.body_offset = model_data['body_offset']
+    preset.body_rotation = model_data.get('body_rotation', (0.0, 0.0, 0.0))
     preset.emitter_offset = model_data['emitter_offset']
     preset.emitter_rotation = model_data['emitter_rotation']
     preset.power = model_data['power']
     preset.throw_ratio = model_data['throw_ratio']
     preset.h_shift = model_data['h_shift']
     preset.v_shift = model_data['v_shift']
+    preset.projection_cone_enabled = model_data.get('projection_cone_enabled', False)
+    preset.projection_cone_length = model_data.get('projection_cone_length', 3.0)
+    preset.body_mesh_vertices_json = model_data.get('body_mesh_vertices_json', '')
+    preset.body_mesh_faces_json = model_data.get('body_mesh_faces_json', '')
     return True
 
 
@@ -867,6 +1097,7 @@ class PROJECTOR_OT_create_projector(Operator):
     body_y: bpy.props.FloatProperty(name='Depth', default=0.12, min=0.01, subtype='DISTANCE')
     body_z: bpy.props.FloatProperty(name='Height', default=0.22, min=0.01, subtype='DISTANCE')
     body_offset: bpy.props.FloatVectorProperty(name='Body Offset', size=3, default=(0.0, -0.06, 0.0), subtype='TRANSLATION')
+    body_rotation: bpy.props.FloatVectorProperty(name='Body Rotation', size=3, default=(0.0, 0.0, 0.0), subtype='EULER', unit='ROTATION')
     emitter_offset: bpy.props.FloatVectorProperty(name='Emitter Offset', size=3, default=(0.0, 0.0, 0.0), subtype='TRANSLATION')
     emitter_rotation: bpy.props.FloatVectorProperty(name='Emitter Rotation', size=3, default=(0.0, 0.0, 0.0), subtype='EULER', unit='ROTATION')
 
@@ -874,6 +1105,8 @@ class PROJECTOR_OT_create_projector(Operator):
     throw_ratio: bpy.props.FloatProperty(name='Throw Ratio', default=0.8, min=0.1, soft_max=3.0)
     h_shift: bpy.props.FloatProperty(name='Horizontal Shift', default=0.0, soft_min=-20.0, soft_max=20.0, subtype='PERCENTAGE')
     v_shift: bpy.props.FloatProperty(name='Vertical Shift', default=0.0, soft_min=-20.0, soft_max=20.0, subtype='PERCENTAGE')
+    projection_cone_enabled: bpy.props.BoolProperty(name='Show Projection Cone', default=False)
+    projection_cone_length: bpy.props.FloatProperty(name='Cone Length (m)', default=0.0, min=0.0)
 
     use_saved_model: bpy.props.BoolProperty(name='Use Saved Model', default=False)
     saved_model: bpy.props.EnumProperty(name='Saved Model', items=_model_preset_items)
@@ -892,7 +1125,15 @@ class PROJECTOR_OT_create_projector(Operator):
 
         layout.prop(self, 'use_saved_model')
         if self.use_saved_model:
-            layout.prop(self, 'saved_model')
+            # Keep selected model in WM as fallback for stale operator instances during reload.
+            context.window_manager['projector_saved_model_pending'] = self.saved_model
+            row_model = layout.row(align=True)
+            row_model.prop(self, 'saved_model', text='Saved Model')
+            op_del = row_model.operator('projector.delete_saved_model', text='', icon='X')
+            if hasattr(op_del, 'skip_dialog'):
+                op_del.skip_dialog = True
+            if hasattr(op_del, 'saved_model'):
+                op_del.saved_model = self.saved_model
 
         box = layout.box()
         box.label(text='Body')
@@ -903,11 +1144,13 @@ class PROJECTOR_OT_create_projector(Operator):
             row.prop(self, 'body_y')
             row.prop(self, 'body_z')
         box.prop(self, 'body_offset')
+        box.prop(self, 'body_rotation')
 
         beam = layout.box()
-        beam.label(text='Beam Origin and Direction')
-        beam.prop(self, 'emitter_offset')
-        beam.prop(self, 'emitter_rotation')
+        beam.label(text='Projection Cone')
+        beam.prop(self, 'projection_cone_enabled')
+        if getattr(self, 'projection_cone_enabled', False):
+            beam.prop(self, 'projection_cone_length')
 
         proj = layout.box()
         proj.label(text='Projector Settings')
@@ -931,12 +1174,17 @@ class PROJECTOR_OT_create_projector(Operator):
                         'body_type': preset.body_type,
                         'body_dimensions': tuple(preset.body_dimensions),
                         'body_offset': tuple(preset.body_offset),
+                        'body_rotation': tuple(preset.body_rotation),
                         'emitter_offset': tuple(preset.emitter_offset),
                         'emitter_rotation': tuple(preset.emitter_rotation),
                         'power': preset.power,
                         'throw_ratio': preset.throw_ratio,
                         'h_shift': preset.h_shift,
                         'v_shift': preset.v_shift,
+                        'projection_cone_enabled': preset.projection_cone_enabled,
+                        'projection_cone_length': preset.projection_cone_length,
+                        'body_mesh_vertices_json': preset.body_mesh_vertices_json,
+                        'body_mesh_faces_json': preset.body_mesh_faces_json,
                     }
                 except (ValueError, IndexError):
                     pass
@@ -946,17 +1194,40 @@ class PROJECTOR_OT_create_projector(Operator):
                 'body_type': self.body_type,
                 'body_dimensions': (self.body_x, self.body_y, self.body_z),
                 'body_offset': tuple(self.body_offset),
+                'body_rotation': tuple(self.body_rotation),
                 'emitter_offset': tuple(self.emitter_offset),
                 'emitter_rotation': tuple(self.emitter_rotation),
                 'power': self.power,
                 'throw_ratio': self.throw_ratio,
                 'h_shift': self.h_shift,
                 'v_shift': self.v_shift,
+                'projection_cone_enabled': getattr(self, 'projection_cone_enabled', False),
+                'projection_cone_length': getattr(self, 'projection_cone_length', 3.0),
+                'body_mesh_vertices_json': '',
+                'body_mesh_faces_json': '',
             }
 
         _apply_model_to_projector(projector, model_data)
 
-        if model_data['body_type'] == 'SELECTED_OBJECT':
+        if model_data.get('body_mesh_vertices_json'):
+            existing_body = get_projector_body(projector)
+            if existing_body is not None:
+                old_mesh = existing_body.data
+                bpy.data.objects.remove(existing_body, do_unlink=True)
+                if old_mesh and old_mesh.users == 0:
+                    bpy.data.meshes.remove(old_mesh, do_unlink=True)
+            restored = _create_body_from_mesh_data(
+                projector,
+                model_data.get('body_mesh_vertices_json', ''),
+                model_data.get('body_mesh_faces_json', ''),
+            )
+            if restored is not None:
+                restored.location = Vector(model_data['body_offset'])
+                restored.rotation_euler = Euler(model_data.get('body_rotation', (0.0, 0.0, 0.0)), 'XYZ')
+                projector.proj_settings.body_type = 'SELECTED_OBJECT'
+            else:
+                _apply_body(projector, projector.proj_settings)
+        elif model_data['body_type'] == 'SELECTED_OBJECT':
             try:
                 existing_body = get_projector_body(projector)
                 if existing_body is not None:
@@ -974,6 +1245,7 @@ class PROJECTOR_OT_create_projector(Operator):
             _apply_body(projector, projector.proj_settings)
 
         _apply_emitter_transform(projector, projector.proj_settings)
+        _apply_projection_cone(projector, projector.proj_settings)
         if projector.proj_settings.body_type == 'DEFAULT_BOX' and get_projector_body(projector) is None:
             _ensure_default_body(projector)
             _apply_body(projector, projector.proj_settings)
@@ -985,13 +1257,43 @@ def _model_data_from_settings(settings):
         'body_type': settings.body_type,
         'body_dimensions': tuple(settings.body_dimensions),
         'body_offset': tuple(settings.body_offset),
+        'body_rotation': tuple(settings.body_rotation),
         'emitter_offset': tuple(settings.emitter_offset),
         'emitter_rotation': tuple(settings.emitter_rotation),
         'power': settings.power,
         'throw_ratio': settings.throw_ratio,
         'h_shift': settings.h_shift,
         'v_shift': settings.v_shift,
+        'projection_cone_enabled': settings.projection_cone_enabled,
+        'projection_cone_length': settings.projection_cone_length,
+        'body_mesh_vertices_json': '',
+        'body_mesh_faces_json': '',
     }
+
+
+def _model_data_from_projector(projector):
+    settings = projector.proj_settings
+    data = _model_data_from_settings(settings)
+    body = get_projector_body(projector)
+    if body is None:
+        return data
+
+    data['body_offset'] = tuple(body.location)
+    data['body_rotation'] = tuple(body.rotation_euler)
+
+    # Persist the current configured body geometry, not only defaults.
+    if body.type == 'MESH':
+        dims = body.dimensions
+        data['body_dimensions'] = (
+            max(float(dims.x), 0.01),
+            max(float(dims.y), 0.01),
+            max(float(dims.z), 0.01),
+        )
+        vertices_json, faces_json = _serialize_mesh_data(body)
+        data['body_mesh_vertices_json'] = vertices_json
+        data['body_mesh_faces_json'] = faces_json
+
+    return data
 
 
 class PROJECTOR_OT_apply_saved_model(Operator):
@@ -1018,7 +1320,7 @@ class PROJECTOR_OT_apply_saved_model(Operator):
         if projector is None:
             return {'CANCELLED'}
 
-        model_key = self.saved_model
+        model_key = getattr(self, 'saved_model', 'NONE')
         if model_key == 'NONE':
             self.report({'WARNING'}, 'Select a saved model first.')
             return {'CANCELLED'}
@@ -1037,16 +1339,41 @@ class PROJECTOR_OT_apply_saved_model(Operator):
             'body_type': preset.body_type,
             'body_dimensions': tuple(preset.body_dimensions),
             'body_offset': tuple(preset.body_offset),
+            'body_rotation': tuple(preset.body_rotation),
             'emitter_offset': tuple(preset.emitter_offset),
             'emitter_rotation': tuple(preset.emitter_rotation),
             'power': preset.power,
             'throw_ratio': preset.throw_ratio,
             'h_shift': preset.h_shift,
             'v_shift': preset.v_shift,
+            'projection_cone_enabled': preset.projection_cone_enabled,
+            'projection_cone_length': preset.projection_cone_length,
+            'body_mesh_vertices_json': preset.body_mesh_vertices_json,
+            'body_mesh_faces_json': preset.body_mesh_faces_json,
         }
         _apply_model_to_projector(projector, model_data)
-        _apply_body(projector, projector.proj_settings)
+        if model_data.get('body_mesh_vertices_json'):
+            existing_body = get_projector_body(projector)
+            if existing_body is not None:
+                old_mesh = existing_body.data
+                bpy.data.objects.remove(existing_body, do_unlink=True)
+                if old_mesh and old_mesh.users == 0:
+                    bpy.data.meshes.remove(old_mesh, do_unlink=True)
+            restored = _create_body_from_mesh_data(
+                projector,
+                model_data.get('body_mesh_vertices_json', ''),
+                model_data.get('body_mesh_faces_json', ''),
+            )
+            if restored is not None:
+                restored.location = Vector(model_data['body_offset'])
+                restored.rotation_euler = Euler(model_data.get('body_rotation', (0.0, 0.0, 0.0)), 'XYZ')
+                projector.proj_settings.body_type = 'SELECTED_OBJECT'
+            else:
+                _apply_body(projector, projector.proj_settings)
+        else:
+            _apply_body(projector, projector.proj_settings)
         _apply_emitter_transform(projector, projector.proj_settings)
+        _apply_projection_cone(projector, projector.proj_settings)
         self.report({'INFO'}, f'Applied model: {preset.manufacturer} - {preset.model_name}')
         return {'FINISHED'}
 
@@ -1077,7 +1404,7 @@ class PROJECTOR_OT_save_model_from_selected(Operator):
         projector = get_projector(context)
         if projector is None:
             return {'CANCELLED'}
-        model_data = _model_data_from_settings(projector.proj_settings)
+        model_data = _model_data_from_projector(projector)
         if _store_model_preset_from_data(self.manufacturer, self.model_name, model_data):
             self.report({'INFO'}, f'Saved model {self.manufacturer} - {self.model_name}')
             return {'FINISHED'}
@@ -1090,6 +1417,7 @@ class PROJECTOR_OT_delete_saved_model(Operator):
     bl_label = 'Delete Saved Model'
     bl_options = {'REGISTER', 'UNDO'}
     saved_model: bpy.props.EnumProperty(name='Saved Model', items=_saved_model_items, default='NONE')
+    skip_dialog: bpy.props.BoolProperty(name='Skip Dialog', default=False)
 
     @classmethod
     def poll(cls, context):
@@ -1097,6 +1425,8 @@ class PROJECTOR_OT_delete_saved_model(Operator):
         return prefs is not None and len(prefs.projector_models) > 0
 
     def invoke(self, context, event):
+        if getattr(self, 'skip_dialog', False):
+            return self.execute(context)
         return context.window_manager.invoke_props_dialog(self, width=360)
 
     def draw(self, context):
@@ -1106,7 +1436,9 @@ class PROJECTOR_OT_delete_saved_model(Operator):
         layout.prop(self, 'saved_model')
 
     def execute(self, context):
-        model_key = self.saved_model
+        model_key = getattr(self, 'saved_model', None)
+        if not model_key or model_key == 'NONE':
+            model_key = context.window_manager.get('projector_saved_model_pending', 'NONE')
         if model_key == 'NONE':
             self.report({'WARNING'}, 'Select a saved model to delete.')
             return {'CANCELLED'}
@@ -1119,11 +1451,97 @@ class PROJECTOR_OT_delete_saved_model(Operator):
             idx = int(model_key)
             label = f'{prefs.projector_models[idx].manufacturer} - {prefs.projector_models[idx].model_name}'
             prefs.projector_models.remove(idx)
+            context.window_manager['projector_saved_model_pending'] = 'NONE'
             self.report({'INFO'}, f'Deleted model: {label}')
             return {'FINISHED'}
         except (ValueError, IndexError):
             self.report({'ERROR'}, 'Saved model not found.')
             return {'CANCELLED'}
+
+
+class PROJECTOR_OT_export_projection_cone(Operator):
+    bl_idname = 'projector.export_projection_cone'
+    bl_label = 'Export Cone Copy'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return get_projector(context) is not None
+
+    def execute(self, context):
+        projector = get_projector(context)
+        if projector is None:
+            return {'CANCELLED'}
+
+        cone = get_projector_cone(projector)
+        if cone is None:
+            self.report({'ERROR'}, 'No projection cone found. Enable Show Projection Cone first.')
+            return {'CANCELLED'}
+
+        coll_name = 'Projector Cone Copies'
+        target_collection = bpy.data.collections.get(coll_name)
+        if target_collection is None:
+            target_collection = bpy.data.collections.new(coll_name)
+            context.scene.collection.children.link(target_collection)
+
+        exported = _export_independent_cone_copy(cone, f'{projector.name}.ConeCopy', target_collection)
+        if exported is None:
+            self.report({'ERROR'}, 'Failed to create cone copy.')
+            return {'CANCELLED'}
+        self.report({'INFO'}, f'Cone copy created in collection "{coll_name}".')
+        return {'FINISHED'}
+
+
+def _export_independent_cone_copy(cone, name, target_collection):
+    if cone is None or cone.data is None:
+        return None
+
+    mesh_copy = cone.data.copy()
+    # Bake final world transform into geometry so the copy has no dependency on parent chain.
+    mesh_copy.transform(cone.matrix_world)
+
+    obj = bpy.data.objects.new(name, mesh_copy)
+    obj.parent = None
+    obj.matrix_world.identity()
+    if PROJECTOR_CONE_TAG in obj:
+        del obj[PROJECTOR_CONE_TAG]
+    target_collection.objects.link(obj)
+    return obj
+
+
+class PROJECTOR_OT_export_all_projection_cones(Operator):
+    bl_idname = 'projector.export_all_projection_cones'
+    bl_label = 'Export All Cone Copies'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        projectors = get_projectors(context, only_selected=False)
+        if not projectors:
+            self.report({'ERROR'}, 'No projectors found in scene.')
+            return {'CANCELLED'}
+
+        coll_name = 'Projector Cone Copies'
+        target_collection = bpy.data.collections.get(coll_name)
+        if target_collection is None:
+            target_collection = bpy.data.collections.new(coll_name)
+            context.scene.collection.children.link(target_collection)
+
+        count = 0
+        for projector in projectors:
+            cone = get_projector_cone(projector)
+            if cone is None:
+                continue
+            name = f'{projector.name}.ConeCopy'
+            exported = _export_independent_cone_copy(cone, name, target_collection)
+            if exported is not None:
+                count += 1
+
+        if count == 0:
+            self.report({'WARNING'}, 'No active projection cones found.')
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f'Created {count} independent cone copies in "{coll_name}".')
+        return {'FINISHED'}
 
 
 def update_projected_texture(proj_settings, context):
@@ -1170,9 +1588,20 @@ class PROJECTOR_OT_delete_projector(Operator):
     def execute(self, context):
         selected_projectors = get_projectors(context, only_selected=True)
         for projector in selected_projectors:
-            for child in projector.children:
-                bpy.data.objects.remove(child, do_unlink=True)
-            else:
+            # Remove whole hierarchy (children, grandchildren, etc.) first.
+            stack = list(projector.children)
+            descendants = []
+            while stack:
+                child = stack.pop()
+                descendants.append(child)
+                stack.extend(child.children)
+
+            # Remove deepest objects first to avoid orphaned hierarchy leftovers.
+            for obj in reversed(descendants):
+                if obj.name in bpy.data.objects:
+                    bpy.data.objects.remove(obj, do_unlink=True)
+
+            if projector.name in bpy.data.objects:
                 bpy.data.objects.remove(projector, do_unlink=True)
         return {'FINISHED'}
 
@@ -1241,6 +1670,13 @@ class ProjectorSettings(bpy.types.PropertyGroup):
         default=(0.0, -0.06, 0.0),
         subtype='TRANSLATION',
         update=update_body)
+    body_rotation: bpy.props.FloatVectorProperty(
+        name='Body Rotation',
+        size=3,
+        default=(0.0, 0.0, 0.0),
+        subtype='EULER',
+        unit='ROTATION',
+        update=update_body)
     emitter_offset: bpy.props.FloatVectorProperty(
         name='Emitter Offset',
         size=3,
@@ -1254,6 +1690,17 @@ class ProjectorSettings(bpy.types.PropertyGroup):
         subtype='EULER',
         unit='ROTATION',
         update=update_emitter_transform)
+    projection_cone_enabled: bpy.props.BoolProperty(
+        name='Show Projection Cone',
+        default=False,
+        update=update_projection_cone)
+    projection_cone_length: bpy.props.FloatProperty(
+        name='Cone Length',
+        default=3.0,
+        min=0.2,
+        subtype='DISTANCE',
+        unit='LENGTH',
+        update=update_projection_cone)
 
 
 def register():
@@ -1264,6 +1711,8 @@ def register():
     _safe_register_class(PROJECTOR_OT_apply_saved_model)
     _safe_register_class(PROJECTOR_OT_save_model_from_selected)
     _safe_register_class(PROJECTOR_OT_delete_saved_model)
+    _safe_register_class(PROJECTOR_OT_export_projection_cone)
+    _safe_register_class(PROJECTOR_OT_export_all_projection_cones)
     _safe_register_class(PROJECTOR_OT_delete_projector)
     _safe_register_class(PROJECTOR_OT_change_color_randomly)
     bpy.types.Object.proj_settings = bpy.props.PointerProperty(
@@ -1277,6 +1726,8 @@ def unregister():
     _safe_unregister_class(PROJECTOR_OT_delete_projector)
     _safe_unregister_class(PROJECTOR_OT_delete_saved_model)
     _safe_unregister_class(PROJECTOR_OT_save_model_from_selected)
+    _safe_unregister_class(PROJECTOR_OT_export_all_projection_cones)
+    _safe_unregister_class(PROJECTOR_OT_export_projection_cone)
     _safe_unregister_class(PROJECTOR_OT_apply_saved_model)
     _safe_unregister_class(PROJECTOR_OT_create_projector)
     _safe_unregister_class(ProjectorSettings)

@@ -66,15 +66,17 @@ class PROJECTOR_PT_projector_settings(Panel):
                 row = body_box.row(align=True)
                 row.prop(proj_settings, 'body_dimensions', text='Size')
             body_box.prop(proj_settings, 'body_offset')
-            body_box.prop(proj_settings, 'emitter_offset')
-            body_box.prop(proj_settings, 'emitter_rotation')
+            body_box.prop(proj_settings, 'body_rotation')
+            body_box.prop(proj_settings, 'projection_cone_enabled')
+            if proj_settings.projection_cone_enabled:
+                body_box.prop(proj_settings, 'projection_cone_length')
+            row_cone = body_box.row(align=True)
+            row_cone.operator('projector.export_projection_cone', text='Copy This Cone')
+            row_cone.operator('projector.export_all_projection_cones', text='Copy All Cones')
 
             layout.separator()
             layout.label(text='Saved Models:')
             model_box = layout.box()
-            row = model_box.row(align=True)
-            row.operator('projector.apply_saved_model', text='Apply')
-            row.operator('projector.delete_saved_model', text='Delete')
             model_box.operator('projector.save_model_from_selected', text='Save Current')
 
             # Custom Texture
