@@ -164,7 +164,7 @@ class ProjectorModelPreset(PropertyGroup):
     model_name: bpy.props.StringProperty(name='Model')
     body_type: bpy.props.EnumProperty(name='Body Type', items=BODY_TYPES, default='DEFAULT_BOX')
     body_dimensions: bpy.props.FloatVectorProperty(name='Body Dimensions', size=3, default=(0.35, 0.12, 0.22), min=0.01, subtype='XYZ')
-    body_offset: bpy.props.FloatVectorProperty(name='Body Offset', size=3, default=(0.0, -0.06, 0.0), subtype='TRANSLATION')
+    body_offset: bpy.props.FloatVectorProperty(name='Body Offset', size=3, default=(0.0, 0.0, 0.), subtype='TRANSLATION')
     body_rotation: bpy.props.FloatVectorProperty(name='Body Rotation', size=3, default=(0.0, 0.0, 0.0), subtype='EULER', unit='ROTATION')
     emitter_offset: bpy.props.FloatVectorProperty(name='Emitter Offset', size=3, default=(0.0, 0.0, 0.0), subtype='TRANSLATION')
     emitter_rotation: bpy.props.FloatVectorProperty(name='Emitter Rotation', size=3, default=(0.0, 0.0, 0.0), subtype='EULER', unit='ROTATION')
@@ -998,7 +998,7 @@ def create_projector(context):
 
 
 def init_projector(proj_settings, context):
-    # # Add custom properties to store projector settings on the camera obj.
+    # # Add custom properties to store projector settings on the camera obj..
     proj_settings.throw_ratio = 0.8
     proj_settings.power = 1000.0
     proj_settings.projected_texture = Textures.CHECKER.value
@@ -1096,7 +1096,7 @@ class PROJECTOR_OT_create_projector(Operator):
     body_x: bpy.props.FloatProperty(name='Length', default=0.35, min=0.01, subtype='DISTANCE')
     body_y: bpy.props.FloatProperty(name='Depth', default=0.12, min=0.01, subtype='DISTANCE')
     body_z: bpy.props.FloatProperty(name='Height', default=0.22, min=0.01, subtype='DISTANCE')
-    body_offset: bpy.props.FloatVectorProperty(name='Body Offset', size=3, default=(0.0, -0.06, 0.0), subtype='TRANSLATION')
+    body_offset: bpy.props.FloatVectorProperty(name='Body Offset', size=3, default=(0.0, 0.0, 0.), subtype='TRANSLATION')
     body_rotation: bpy.props.FloatVectorProperty(name='Body Rotation', size=3, default=(0.0, 0.0, 0.0), subtype='EULER', unit='ROTATION')
     emitter_offset: bpy.props.FloatVectorProperty(name='Emitter Offset', size=3, default=(0.0, 0.0, 0.0), subtype='TRANSLATION')
     emitter_rotation: bpy.props.FloatVectorProperty(name='Emitter Rotation', size=3, default=(0.0, 0.0, 0.0), subtype='EULER', unit='ROTATION')
@@ -1667,7 +1667,7 @@ class ProjectorSettings(bpy.types.PropertyGroup):
     body_offset: bpy.props.FloatVectorProperty(
         name='Body Offset',
         size=3,
-        default=(0.0, -0.06, 0.0),
+        default=(0.0, 0.0, 0.12),
         subtype='TRANSLATION',
         update=update_body)
     body_rotation: bpy.props.FloatVectorProperty(
