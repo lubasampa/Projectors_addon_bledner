@@ -1009,7 +1009,7 @@ def init_projector(proj_settings, context):
     proj_settings.use_custom_texture_res = True
     proj_settings.body_type = 'DEFAULT_BOX'
     proj_settings.body_dimensions = (0.35, 0.12, 0.22)
-    proj_settings.body_offset = (0.0, -0.06, 0.0)
+    proj_settings.body_offset = (0.0, 0.0, 0.12)
     proj_settings.body_rotation = (0.0, 0.0, 0.0)
     proj_settings.emitter_offset = (0.0, 0.0, 0.0)
     proj_settings.emitter_rotation = (0.0, 0.0, 0.0)
