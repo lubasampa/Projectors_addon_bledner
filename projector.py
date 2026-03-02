@@ -18,6 +18,142 @@ log = logging.getLogger(name=__file__)
 PROJECTOR_SPOT_TAG = ADDON_ID.format('spot')
 PROJECTOR_BODY_TAG = ADDON_ID.format('body')
 PROJECTOR_CONE_TAG = ADDON_ID.format('projection_cone')
+MODELS_STORE_FILENAME = 'projector_saved_models.json'
+
+
+def _get_models_store_path():
+    config_dir = bpy.utils.user_resource('CONFIG', path='projector_addon', create=True)
+    if config_dir:
+        return os.path.join(config_dir, MODELS_STORE_FILENAME)
+    return os.path.join(os.path.expanduser('~'), MODELS_STORE_FILENAME)
+
+
+def _as_float_vector(value, default):
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        return default
+    try:
+        return (float(value[0]), float(value[1]), float(value[2]))
+    except (TypeError, ValueError):
+        return default
+
+
+def _clear_projector_models(prefs):
+    for idx in range(len(prefs.projector_models) - 1, -1, -1):
+        prefs.projector_models.remove(idx)
+
+
+def _serialize_models_from_preferences(prefs):
+    models = []
+    for preset in prefs.projector_models:
+        models.append({
+            'manufacturer': preset.manufacturer,
+            'model_name': preset.model_name,
+            'body_type': preset.body_type,
+            'body_dimensions': list(preset.body_dimensions),
+            'body_offset': list(preset.body_offset),
+            'body_rotation': list(preset.body_rotation),
+            'emitter_offset': list(preset.emitter_offset),
+            'emitter_rotation': list(preset.emitter_rotation),
+            'power': float(preset.power),
+            'throw_ratio': float(preset.throw_ratio),
+            'h_shift': float(preset.h_shift),
+            'v_shift': float(preset.v_shift),
+            'projection_cone_enabled': bool(preset.projection_cone_enabled),
+            'projection_cone_length': float(preset.projection_cone_length),
+            'body_mesh_vertices_json': preset.body_mesh_vertices_json,
+            'body_mesh_faces_json': preset.body_mesh_faces_json,
+        })
+    return models
+
+
+def _write_models_store(prefs=None):
+    prefs = prefs or get_addon_preferences()
+    if prefs is None:
+        return False
+
+    path = _get_models_store_path()
+    payload = {
+        'version': 1,
+        'models': _serialize_models_from_preferences(prefs),
+    }
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as handle:
+            json.dump(payload, handle, ensure_ascii=True, indent=2)
+        return True
+    except OSError:
+        log.exception('Failed to write projector model store: %s', path)
+        return False
+
+
+def _read_models_store():
+    path = _get_models_store_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        log.exception('Failed to read projector model store: %s', path)
+        return None
+
+    if isinstance(payload, dict):
+        models = payload.get('models', [])
+    elif isinstance(payload, list):
+        models = payload
+    else:
+        models = []
+    return models if isinstance(models, list) else []
+
+
+def _load_models_store_into_preferences(prefs=None):
+    prefs = prefs or get_addon_preferences()
+    if prefs is None:
+        return False
+
+    stored_models = _read_models_store()
+    if stored_models is None:
+        # Migration path: if only Blender preferences contain models, bootstrap JSON storage.
+        if len(prefs.projector_models) > 0:
+            _write_models_store(prefs)
+            return True
+        return False
+
+    _clear_projector_models(prefs)
+    for data in stored_models:
+        if not isinstance(data, dict):
+            continue
+        manufacturer = str(data.get('manufacturer', '')).strip()
+        model_name = str(data.get('model_name', '')).strip()
+        if not manufacturer or not model_name:
+            continue
+
+        preset = prefs.projector_models.add()
+        preset.manufacturer = manufacturer
+        preset.model_name = model_name
+        preset.body_type = data.get('body_type', 'DEFAULT_BOX')
+        preset.body_dimensions = _as_float_vector(data.get('body_dimensions'), (0.35, 0.12, 0.22))
+        preset.body_offset = _as_float_vector(data.get('body_offset'), (0.0, 0.0, 0.12))
+        preset.body_rotation = _as_float_vector(data.get('body_rotation'), (0.0, 0.0, 0.0))
+        preset.emitter_offset = _as_float_vector(data.get('emitter_offset'), (0.0, 0.0, 0.0))
+        preset.emitter_rotation = _as_float_vector(data.get('emitter_rotation'), (0.0, 0.0, 0.0))
+        try:
+            preset.power = float(data.get('power', 1000.0))
+            preset.throw_ratio = float(data.get('throw_ratio', 0.8))
+            preset.h_shift = float(data.get('h_shift', 0.0))
+            preset.v_shift = float(data.get('v_shift', 0.0))
+            preset.projection_cone_enabled = bool(data.get('projection_cone_enabled', False))
+            preset.projection_cone_length = float(data.get('projection_cone_length', 3.0))
+        except (TypeError, ValueError):
+            preset.power = 1000.0
+            preset.throw_ratio = 0.8
+            preset.h_shift = 0.0
+            preset.v_shift = 0.0
+            preset.projection_cone_enabled = False
+            preset.projection_cone_length = 3.0
+        preset.body_mesh_vertices_json = str(data.get('body_mesh_vertices_json', ''))
+        preset.body_mesh_faces_json = str(data.get('body_mesh_faces_json', ''))
+    return True
 
 
 def _safe_register_class(cls):
@@ -1083,6 +1219,7 @@ def _store_model_preset_from_data(manufacturer, model_name, model_data):
     preset.projection_cone_length = model_data.get('projection_cone_length', 3.0)
     preset.body_mesh_vertices_json = model_data.get('body_mesh_vertices_json', '')
     preset.body_mesh_faces_json = model_data.get('body_mesh_faces_json', '')
+    _write_models_store(prefs)
     return True
 
 
@@ -1451,6 +1588,7 @@ class PROJECTOR_OT_delete_saved_model(Operator):
             idx = int(model_key)
             label = f'{prefs.projector_models[idx].manufacturer} - {prefs.projector_models[idx].model_name}'
             prefs.projector_models.remove(idx)
+            _write_models_store(prefs)
             context.window_manager['projector_saved_model_pending'] = 'NONE'
             self.report({'INFO'}, f'Deleted model: {label}')
             return {'FINISHED'}
@@ -1715,6 +1853,7 @@ def register():
     _safe_register_class(PROJECTOR_OT_export_all_projection_cones)
     _safe_register_class(PROJECTOR_OT_delete_projector)
     _safe_register_class(PROJECTOR_OT_change_color_randomly)
+    _load_models_store_into_preferences()
     bpy.types.Object.proj_settings = bpy.props.PointerProperty(
         type=ProjectorSettings)
 
