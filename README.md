@@ -52,7 +52,7 @@ When creating a projector (`New`), the add-on opens a setup dialog where you can
 * A growing [wiki](https://github.com/Ocupe/Projectors/wiki) to help users with this add-on. If you have problems or feel that something is missing, please feel free to request more content.
 
 ## Installation
-* Download the add-on ZIP from the latest [GitHub Release](https://github.com/Ocupe/Projectors/releases/latest).
+* Download the add-on ZIP from the latest [GitHub Release](https://github.com/lubasampa/Projectors_addon_bledner/releases/latest).
 * Do not use GitHub's **Code** -> **Download ZIP** for installation, because that archive contains repository files used only for development.
 * Open Blender.
 * Go to the User Preferences in the Addon tab.
@@ -60,7 +60,8 @@ When creating a projector (`New`), the add-on opens a setup dialog where you can
 * Activate the add-on by clicking on the checkbox.
 
 ## Releases
-* Pushing a tag like `v2026.2.9` runs the release workflow and generates a clean add-on ZIP as a GitHub Release asset.
+* The latest release is `v2026.3.23`.
+* Pushing a tag like `v2026.3.23` runs the release workflow and generates a clean add-on ZIP as a GitHub Release asset.
 
 ## Missing something?
 I'm interested and open to suggestions. Let me know how you use the add-on and how it could improve. Open an issue or message me.
