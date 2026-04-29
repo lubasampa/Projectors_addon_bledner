@@ -2,9 +2,11 @@ import logging
 import math
 import os
 import json
+import uuid
 
 from enum import Enum
 import bpy
+from bpy.app.handlers import persistent
 from bpy.types import AddonPreferences, Operator, PropertyGroup
 from mathutils import Euler, Vector
 
@@ -18,7 +20,9 @@ log = logging.getLogger(name=__file__)
 PROJECTOR_SPOT_TAG = ADDON_ID.format('spot')
 PROJECTOR_BODY_TAG = ADDON_ID.format('body')
 PROJECTOR_CONE_TAG = ADDON_ID.format('projection_cone')
+PROJECTOR_INSTANCE_TAG = ADDON_ID.format('instance_id')
 MODELS_STORE_FILENAME = 'projector_saved_models.json'
+_PROJECTOR_DUPLICATE_HANDLER_RUNNING = False
 
 
 def _get_models_store_path():
@@ -52,16 +56,26 @@ def _serialize_models_from_preferences(prefs):
             'body_dimensions': list(preset.body_dimensions),
             'body_offset': list(preset.body_offset),
             'body_rotation': list(preset.body_rotation),
+            'projector_location': list(preset.projector_location),
+            'projector_rotation': list(preset.projector_rotation),
+            'projector_scale': list(preset.projector_scale),
             'emitter_offset': list(preset.emitter_offset),
             'emitter_rotation': list(preset.emitter_rotation),
             'power': float(preset.power),
             'throw_ratio': float(preset.throw_ratio),
             'h_shift': float(preset.h_shift),
             'v_shift': float(preset.v_shift),
+            'resolution': preset.resolution,
+            'use_custom_texture_res': bool(preset.use_custom_texture_res),
+            'projected_texture': preset.projected_texture,
+            'projected_color': list(preset.projected_color),
+            'show_pixel_grid': bool(preset.show_pixel_grid),
             'projection_cone_enabled': bool(preset.projection_cone_enabled),
             'projection_cone_length': float(preset.projection_cone_length),
             'body_mesh_vertices_json': preset.body_mesh_vertices_json,
             'body_mesh_faces_json': preset.body_mesh_faces_json,
+            'body_mesh_material_indices_json': preset.body_mesh_material_indices_json,
+            'body_materials_json': preset.body_materials_json,
         })
     return models
 
@@ -135,6 +149,9 @@ def _load_models_store_into_preferences(prefs=None):
         preset.body_dimensions = _as_float_vector(data.get('body_dimensions'), (0.35, 0.12, 0.22))
         preset.body_offset = _as_float_vector(data.get('body_offset'), (0.0, 0.0, 0.12))
         preset.body_rotation = _as_float_vector(data.get('body_rotation'), (0.0, 0.0, 0.0))
+        preset.projector_location = _as_float_vector(data.get('projector_location'), (0.0, 0.0, 0.0))
+        preset.projector_rotation = _as_float_vector(data.get('projector_rotation'), (0.0, 0.0, 0.0))
+        preset.projector_scale = _as_float_vector(data.get('projector_scale'), (1.0, 1.0, 1.0))
         preset.emitter_offset = _as_float_vector(data.get('emitter_offset'), (0.0, 0.0, 0.0))
         preset.emitter_rotation = _as_float_vector(data.get('emitter_rotation'), (0.0, 0.0, 0.0))
         try:
@@ -142,6 +159,11 @@ def _load_models_store_into_preferences(prefs=None):
             preset.throw_ratio = float(data.get('throw_ratio', 0.8))
             preset.h_shift = float(data.get('h_shift', 0.0))
             preset.v_shift = float(data.get('v_shift', 0.0))
+            preset.resolution = str(data.get('resolution', '1920x1080'))
+            preset.use_custom_texture_res = bool(data.get('use_custom_texture_res', True))
+            preset.projected_texture = str(data.get('projected_texture', Textures.CHECKER.value))
+            preset.projected_color = _as_float_vector(data.get('projected_color'), (1.0, 1.0, 1.0))
+            preset.show_pixel_grid = bool(data.get('show_pixel_grid', False))
             preset.projection_cone_enabled = bool(data.get('projection_cone_enabled', False))
             preset.projection_cone_length = float(data.get('projection_cone_length', 3.0))
         except (TypeError, ValueError):
@@ -149,10 +171,17 @@ def _load_models_store_into_preferences(prefs=None):
             preset.throw_ratio = 0.8
             preset.h_shift = 0.0
             preset.v_shift = 0.0
+            preset.resolution = '1920x1080'
+            preset.use_custom_texture_res = True
+            preset.projected_texture = Textures.CHECKER.value
+            preset.projected_color = (1.0, 1.0, 1.0)
+            preset.show_pixel_grid = False
             preset.projection_cone_enabled = False
             preset.projection_cone_length = 3.0
         preset.body_mesh_vertices_json = str(data.get('body_mesh_vertices_json', ''))
         preset.body_mesh_faces_json = str(data.get('body_mesh_faces_json', ''))
+        preset.body_mesh_material_indices_json = str(data.get('body_mesh_material_indices_json', ''))
+        preset.body_materials_json = str(data.get('body_materials_json', ''))
     return True
 
 
@@ -208,6 +237,107 @@ def get_projector_cone(projector):
             return child
         stack.extend(child.children)
     return None
+
+
+def _new_projector_instance_id():
+    return uuid.uuid4().hex
+
+
+def _make_node_groups_local(node_tree):
+    if node_tree is None:
+        return
+    for node in node_tree.nodes:
+        if getattr(node, 'type', None) == 'GROUP' and getattr(node, 'node_tree', None) is not None:
+            if node.node_tree.users > 1:
+                node.node_tree = node.node_tree.copy()
+
+
+def _make_material_slots_local(obj):
+    if obj is None or not hasattr(obj, 'material_slots'):
+        return
+    for slot in obj.material_slots:
+        if slot.material is not None and slot.material.users > 1:
+            slot.material = slot.material.copy()
+
+
+def _make_projector_datablocks_local(projector):
+    if projector is None:
+        return
+
+    if projector.data is not None and projector.data.users > 1:
+        projector.data = projector.data.copy()
+
+    spot = get_projector_spot(projector)
+    if spot is not None:
+        if spot.data is not None and spot.data.users > 1:
+            spot.data = spot.data.copy()
+        _make_node_groups_local(spot.data.node_tree if spot.data else None)
+
+    body = get_projector_body(projector)
+    if body is not None:
+        if body.data is not None and body.data.users > 1:
+            body.data = body.data.copy()
+        _make_material_slots_local(body)
+
+    cone = get_projector_cone(projector)
+    if cone is not None:
+        if cone.data is not None and cone.data.users > 1:
+            cone.data = cone.data.copy()
+        _make_material_slots_local(cone)
+
+
+def _create_spot_for_projector(projector):
+    light_data = bpy.data.lights.new('Projector.Spot', type='SPOT')
+    spot = bpy.data.objects.new('Projector.Spot', light_data)
+    spot.scale = (.01, .01, .01)
+    spot.data.spot_size = math.pi - 0.001
+    spot.data.spot_blend = 0
+    spot.data.shadow_soft_size = 0.0
+    spot.hide_select = True
+    spot[PROJECTOR_SPOT_TAG] = True
+    spot.data.cycles.use_multiple_importance_sampling = False
+    add_projector_node_tree_to_spot(spot)
+    spot.parent = projector
+    spot.matrix_parent_inverse.identity()
+    target_collection = projector.users_collection[0] if projector.users_collection else bpy.context.scene.collection
+    target_collection.objects.link(spot)
+    return spot
+
+
+def _ensure_projector_hierarchy(projector):
+    if get_projector_spot(projector) is None:
+        _create_spot_for_projector(projector)
+        _apply_throw_ratio_to_projector(projector, projector.proj_settings)
+        _apply_body(projector, projector.proj_settings)
+        _apply_emitter_transform(projector, projector.proj_settings)
+        _apply_projection_cone(projector, projector.proj_settings)
+
+
+@persistent
+def _ensure_duplicated_projectors_are_independent(scene, depsgraph=None):
+    global _PROJECTOR_DUPLICATE_HANDLER_RUNNING
+    if _PROJECTOR_DUPLICATE_HANDLER_RUNNING:
+        return
+
+    _PROJECTOR_DUPLICATE_HANDLER_RUNNING = True
+    try:
+        used_ids = set()
+        projectors = [
+            obj for obj in scene.objects
+            if obj.type == 'CAMERA' and obj.name.startswith('Projector') and hasattr(obj, 'proj_settings')
+        ]
+        for projector in projectors:
+            _ensure_projector_hierarchy(projector)
+            instance_id = projector.get(PROJECTOR_INSTANCE_TAG)
+            is_new_instance = not instance_id or instance_id in used_ids
+            if is_new_instance:
+                projector[PROJECTOR_INSTANCE_TAG] = _new_projector_instance_id()
+                _make_projector_datablocks_local(projector)
+            else:
+                _make_projector_datablocks_local(projector)
+            used_ids.add(projector[PROJECTOR_INSTANCE_TAG])
+    finally:
+        _PROJECTOR_DUPLICATE_HANDLER_RUNNING = False
 
 
 def _remove_all_projector_cones(projector):
@@ -302,16 +432,26 @@ class ProjectorModelPreset(PropertyGroup):
     body_dimensions: bpy.props.FloatVectorProperty(name='Body Dimensions', size=3, default=(0.35, 0.12, 0.22), min=0.01, subtype='XYZ')
     body_offset: bpy.props.FloatVectorProperty(name='Body Offset', size=3, default=(0.0, 0.0, 0.12), subtype='TRANSLATION')
     body_rotation: bpy.props.FloatVectorProperty(name='Body Rotation', size=3, default=(0.0, 0.0, 0.0), subtype='EULER', unit='ROTATION')
+    projector_location: bpy.props.FloatVectorProperty(name='Projector Location', size=3, default=(0.0, 0.0, 0.0), subtype='TRANSLATION')
+    projector_rotation: bpy.props.FloatVectorProperty(name='Projector Rotation', size=3, default=(0.0, 0.0, 0.0), subtype='EULER', unit='ROTATION')
+    projector_scale: bpy.props.FloatVectorProperty(name='Projector Scale', size=3, default=(1.0, 1.0, 1.0), subtype='XYZ')
     emitter_offset: bpy.props.FloatVectorProperty(name='Emitter Offset', size=3, default=(0.0, 0.0, 0.0), subtype='TRANSLATION')
     emitter_rotation: bpy.props.FloatVectorProperty(name='Emitter Rotation', size=3, default=(0.0, 0.0, 0.0), subtype='EULER', unit='ROTATION')
     power: bpy.props.FloatProperty(name='Power', default=1000.0, min=0.0, soft_max=999999.0)
     throw_ratio: bpy.props.FloatProperty(name='Throw Ratio', default=0.8, min=0.1, soft_max=3.0)
     h_shift: bpy.props.FloatProperty(name='Horizontal Shift', default=0.0, soft_min=-20.0, soft_max=20.0)
     v_shift: bpy.props.FloatProperty(name='Vertical Shift', default=0.0, soft_min=-20.0, soft_max=20.0)
+    resolution: bpy.props.EnumProperty(name='Resolution', items=RESOLUTIONS, default='1920x1080')
+    use_custom_texture_res: bpy.props.BoolProperty(name='Use Texture Resolution', default=True)
+    projected_texture: bpy.props.EnumProperty(name='Projected Texture', items=PROJECTED_OUTPUTS, default=Textures.CHECKER.value)
+    projected_color: bpy.props.FloatVectorProperty(name='Projected Color', size=3, default=(1.0, 1.0, 1.0), subtype='COLOR')
+    show_pixel_grid: bpy.props.BoolProperty(name='Show Pixel Grid', default=False)
     projection_cone_enabled: bpy.props.BoolProperty(name='Projection Cone', default=False)
     projection_cone_length: bpy.props.FloatProperty(name='Cone Length (m)', default=0.0, min=0.0)
     body_mesh_vertices_json: bpy.props.StringProperty(name='Body Mesh Vertices', default='')
     body_mesh_faces_json: bpy.props.StringProperty(name='Body Mesh Faces', default='')
+    body_mesh_material_indices_json: bpy.props.StringProperty(name='Body Mesh Material Indices', default='')
+    body_materials_json: bpy.props.StringProperty(name='Body Materials', default='')
 
 
 class PROJECTOR_AP_preferences(AddonPreferences):
@@ -611,18 +751,107 @@ def _set_body_from_object(source_obj, projector):
     return body
 
 
+def _serialize_material(mat):
+    if mat is None:
+        return None
+
+    data = {
+        'name': mat.name,
+        'diffuse_color': [float(value) for value in mat.diffuse_color],
+        'use_nodes': bool(mat.use_nodes),
+        'blend_method': getattr(mat, 'blend_method', 'OPAQUE'),
+    }
+    if mat.use_nodes and mat.node_tree is not None:
+        bsdf = mat.node_tree.nodes.get('Principled BSDF')
+        if bsdf is not None:
+            for prop_name, input_name in (
+                ('base_color', 'Base Color'),
+                ('roughness', 'Roughness'),
+                ('metallic', 'Metallic'),
+                ('alpha', 'Alpha'),
+            ):
+                socket = bsdf.inputs.get(input_name)
+                if socket is None:
+                    continue
+                value = socket.default_value
+                if hasattr(value, '__iter__'):
+                    data[prop_name] = [float(item) for item in value]
+                else:
+                    data[prop_name] = float(value)
+    return data
+
+
+def _create_material_from_data(data):
+    if not isinstance(data, dict):
+        return _get_or_create_body_material()
+
+    mat_name = data.get('name') or 'Saved Body Material'
+    source_mat = bpy.data.materials.get(mat_name)
+    if source_mat is not None:
+        return source_mat.copy()
+
+    mat = bpy.data.materials.new(f'{mat_name}.ProjectorCopy')
+    diffuse_color = data.get('diffuse_color', (0.17, 0.17, 0.19, 1.0))
+    try:
+        mat.diffuse_color = tuple(diffuse_color)
+    except (TypeError, ValueError):
+        mat.diffuse_color = (0.17, 0.17, 0.19, 1.0)
+
+    mat.use_nodes = bool(data.get('use_nodes', True))
+    if mat.use_nodes and mat.node_tree is not None:
+        bsdf = mat.node_tree.nodes.get('Principled BSDF')
+        if bsdf is not None:
+            if 'base_color' in data and bsdf.inputs.get('Base Color') is not None:
+                bsdf.inputs['Base Color'].default_value = tuple(data['base_color'])
+            if 'roughness' in data and bsdf.inputs.get('Roughness') is not None:
+                bsdf.inputs['Roughness'].default_value = float(data['roughness'])
+            if 'metallic' in data and bsdf.inputs.get('Metallic') is not None:
+                bsdf.inputs['Metallic'].default_value = float(data['metallic'])
+            if 'alpha' in data and bsdf.inputs.get('Alpha') is not None:
+                bsdf.inputs['Alpha'].default_value = float(data['alpha'])
+
+    if hasattr(mat, 'blend_method'):
+        mat.blend_method = data.get('blend_method', 'OPAQUE')
+    return mat
+
+
+def _serialize_body_materials(obj):
+    if obj is None or obj.type != 'MESH' or obj.data is None:
+        return ''
+    materials = [_serialize_material(slot.material) for slot in obj.material_slots if slot.material is not None]
+    return json.dumps(materials) if materials else ''
+
+
+def _apply_body_materials(obj, materials_json):
+    if obj is None or obj.type != 'MESH' or obj.data is None:
+        return
+    obj.data.materials.clear()
+    materials = []
+    if materials_json:
+        try:
+            materials = json.loads(materials_json)
+        except json.JSONDecodeError:
+            materials = []
+    if not materials:
+        obj.data.materials.append(_get_or_create_body_material())
+        return
+    for material_data in materials:
+        obj.data.materials.append(_create_material_from_data(material_data))
+
+
 def _serialize_mesh_data(obj):
     if obj is None or obj.type != 'MESH' or obj.data is None:
-        return '', ''
+        return '', '', ''
     mesh = obj.data
     vertices = [[float(v.co.x), float(v.co.y), float(v.co.z)] for v in mesh.vertices]
     faces = [list(p.vertices) for p in mesh.polygons if len(p.vertices) >= 3]
+    material_indices = [int(p.material_index) for p in mesh.polygons if len(p.vertices) >= 3]
     if not vertices or not faces:
-        return '', ''
-    return json.dumps(vertices), json.dumps(faces)
+        return '', '', ''
+    return json.dumps(vertices), json.dumps(faces), json.dumps(material_indices)
 
 
-def _create_body_from_mesh_data(projector, vertices_json, faces_json):
+def _create_body_from_mesh_data(projector, vertices_json, faces_json, material_indices_json='', materials_json=''):
     if not vertices_json or not faces_json:
         return None
     try:
@@ -636,6 +865,18 @@ def _create_body_from_mesh_data(projector, vertices_json, faces_json):
     mesh = bpy.data.meshes.new('_Projector.BodyMesh.Template')
     mesh.from_pydata(vertices, [], faces)
     mesh.update()
+    material_indices = []
+    if material_indices_json:
+        try:
+            material_indices = json.loads(material_indices_json)
+        except json.JSONDecodeError:
+            material_indices = []
+    for poly, material_index in zip(mesh.polygons, material_indices):
+        try:
+            poly.material_index = int(material_index)
+        except (TypeError, ValueError):
+            poly.material_index = 0
+
     body = bpy.data.objects.new('Projector.Body', mesh)
     body[PROJECTOR_BODY_TAG] = True
     body.parent = projector
@@ -645,8 +886,7 @@ def _create_body_from_mesh_data(projector, vertices_json, faces_json):
     body.display_type = 'SOLID'
     target_collection = projector.users_collection[0] if projector.users_collection else bpy.context.scene.collection
     target_collection.objects.link(body)
-    mat = _get_or_create_body_material()
-    body.data.materials.append(mat)
+    _apply_body_materials(body, materials_json)
     return body
 
 
@@ -855,14 +1095,35 @@ def get_resolution(proj_settings, context):
     return _get_resolution_for_projector(get_projector(context), proj_settings)
 
 
-def update_throw_ratio(proj_settings, context):
-    """
-    Adjust some settings on a camera to achieve a throw ratio
-    """
-    projector = get_projector(context)
+def _apply_lens_shift_to_projector(projector, proj_settings):
     if projector is None:
         return
-    # Update properties of the camera.
+    h_shift = proj_settings.get('h_shift', 0.0) / 100
+    v_shift = proj_settings.get('v_shift', 0.0) / 100
+    throw_ratio = proj_settings.get('throw_ratio')
+
+    w, h = _get_resolution_for_projector(projector, proj_settings)
+    inverted_aspect_ratio = h/w
+
+    cam = projector
+    cam.data.shift_x = h_shift
+    cam.data.shift_y = v_shift * inverted_aspect_ratio
+
+    spot = get_projector_spot(projector)
+    if spot is None:
+        return
+    nodes = spot.data.node_tree.nodes['Group'].node_tree.nodes
+    if bpy.app.version < (2, 81):
+        nodes['Mapping.001'].translation[0] = h_shift / throw_ratio
+        nodes['Mapping.001'].translation[1] = v_shift / throw_ratio * inverted_aspect_ratio
+    else:
+        nodes['Mapping.001'].inputs[1].default_value[0] = h_shift / throw_ratio
+        nodes['Mapping.001'].inputs[1].default_value[1] = v_shift / throw_ratio * inverted_aspect_ratio
+
+
+def _apply_throw_ratio_to_projector(projector, proj_settings):
+    if projector is None:
+        return
     throw_ratio = proj_settings.get('throw_ratio')
     distance = 1
     alpha = math.atan((distance/throw_ratio)*.5) * 2
@@ -871,15 +1132,12 @@ def update_throw_ratio(proj_settings, context):
     projector.data.sensor_width = 10
     projector.data.display_size = 1
 
-    # Adjust Texture to fit new camera ###
-    w, h = get_resolution(proj_settings, context)
+    w, h = _get_resolution_for_projector(projector, proj_settings)
     aspect_ratio = w/h
     inverted_aspect_ratio = 1/aspect_ratio
 
-    # Projected Texture
-    update_projected_texture(proj_settings, context)
+    _apply_projected_texture_to_projector(projector, proj_settings)
 
-    # Update spotlight properties.
     spot = get_projector_spot(projector)
     if spot is None:
         return
@@ -892,9 +1150,16 @@ def update_throw_ratio(proj_settings, context):
         nodes['Mapping.001'].inputs[3].default_value[1] = 1 / \
             throw_ratio * inverted_aspect_ratio
 
-    # Update lens shift because it depends on the throw ratio.
-    update_lens_shift(proj_settings, context)
-    update_projection_cone(proj_settings, context)
+    _apply_lens_shift_to_projector(projector, proj_settings)
+    _apply_projection_cone(projector, proj_settings)
+
+
+def update_throw_ratio(proj_settings, context):
+    """
+    Adjust some settings on a camera to achieve a throw ratio
+    """
+    projector = get_projector(context)
+    _apply_throw_ratio_to_projector(projector, proj_settings)
 
     
 
@@ -904,31 +1169,7 @@ def update_lens_shift(proj_settings, context):
     Apply the shift to the camera and texture.
     """
     projector = get_projector(context)
-    if projector is None:
-        return
-    h_shift = proj_settings.get('h_shift', 0.0) / 100
-    v_shift = proj_settings.get('v_shift', 0.0) / 100
-    throw_ratio = proj_settings.get('throw_ratio')
-
-    w, h = get_resolution(proj_settings, context)
-    inverted_aspect_ratio = h/w
-
-    # Update the properties of the camera.
-    cam = projector
-    cam.data.shift_x = h_shift
-    cam.data.shift_y = v_shift * inverted_aspect_ratio
-
-    # Update spotlight node setup.
-    spot = get_projector_spot(projector)
-    if spot is None:
-        return
-    nodes = spot.data.node_tree.nodes['Group'].node_tree.nodes
-    if bpy.app.version < (2, 81):
-        nodes['Mapping.001'].translation[0] = h_shift / throw_ratio
-        nodes['Mapping.001'].translation[1] = v_shift / throw_ratio * inverted_aspect_ratio
-    else:
-        nodes['Mapping.001'].inputs[1].default_value[0] = h_shift / throw_ratio
-        nodes['Mapping.001'].inputs[1].default_value[1] = v_shift / throw_ratio * inverted_aspect_ratio
+    _apply_lens_shift_to_projector(projector, proj_settings)
     update_projection_cone(proj_settings, context)
 
 
@@ -1123,6 +1364,7 @@ def create_projector(context):
                               rotation=(0, 0, 0))
     cam = context.object
     cam.name = 'Projector'
+    cam[PROJECTOR_INSTANCE_TAG] = _new_projector_instance_id()
 
     # Parent light to cam.
     spot.parent = cam
@@ -1167,10 +1409,22 @@ def init_projector(proj_settings, context):
 
 def _apply_model_to_projector(projector, model_data):
     settings = projector.proj_settings
+    projector.location = Vector(model_data.get('projector_location', tuple(projector.location)))
+    projector.rotation_euler = Euler(model_data.get('projector_rotation', tuple(projector.rotation_euler)), 'XYZ')
+    projector.scale = Vector(model_data.get('projector_scale', tuple(projector.scale)))
     settings.throw_ratio = model_data['throw_ratio']
     settings.power = model_data['power']
     settings.h_shift = model_data['h_shift']
     settings.v_shift = model_data['v_shift']
+    resolution = model_data.get('resolution', settings.resolution)
+    if any(item[0] == resolution for item in RESOLUTIONS):
+        settings.resolution = resolution
+    settings.use_custom_texture_res = model_data.get('use_custom_texture_res', settings.use_custom_texture_res)
+    projected_texture = model_data.get('projected_texture', settings.projected_texture)
+    if projected_texture in {item[0] for item in PROJECTED_OUTPUTS}:
+        settings.projected_texture = projected_texture
+    settings.projected_color = model_data.get('projected_color', tuple(settings.projected_color))
+    settings.show_pixel_grid = model_data.get('show_pixel_grid', settings.show_pixel_grid)
     settings.projection_cone_enabled = model_data.get('projection_cone_enabled', False)
     settings.projection_cone_length = model_data.get('projection_cone_length', 3.0)
     settings.body_type = model_data['body_type']
@@ -1179,6 +1433,35 @@ def _apply_model_to_projector(projector, model_data):
     settings.body_rotation = model_data.get('body_rotation', (0.0, 0.0, 0.0))
     settings.emitter_offset = model_data['emitter_offset']
     settings.emitter_rotation = model_data['emitter_rotation']
+
+
+def _model_data_from_preset(preset):
+    return {
+        'body_type': preset.body_type,
+        'body_dimensions': tuple(preset.body_dimensions),
+        'body_offset': tuple(preset.body_offset),
+        'body_rotation': tuple(preset.body_rotation),
+        'projector_location': tuple(preset.projector_location),
+        'projector_rotation': tuple(preset.projector_rotation),
+        'projector_scale': tuple(preset.projector_scale),
+        'emitter_offset': tuple(preset.emitter_offset),
+        'emitter_rotation': tuple(preset.emitter_rotation),
+        'power': preset.power,
+        'throw_ratio': preset.throw_ratio,
+        'h_shift': preset.h_shift,
+        'v_shift': preset.v_shift,
+        'resolution': preset.resolution,
+        'use_custom_texture_res': preset.use_custom_texture_res,
+        'projected_texture': preset.projected_texture,
+        'projected_color': tuple(preset.projected_color),
+        'show_pixel_grid': preset.show_pixel_grid,
+        'projection_cone_enabled': preset.projection_cone_enabled,
+        'projection_cone_length': preset.projection_cone_length,
+        'body_mesh_vertices_json': preset.body_mesh_vertices_json,
+        'body_mesh_faces_json': preset.body_mesh_faces_json,
+        'body_mesh_material_indices_json': preset.body_mesh_material_indices_json,
+        'body_materials_json': preset.body_materials_json,
+    }
 
 
 def _store_model_preset_from_data(manufacturer, model_name, model_data):
@@ -1209,16 +1492,26 @@ def _store_model_preset_from_data(manufacturer, model_name, model_data):
     preset.body_dimensions = model_data['body_dimensions']
     preset.body_offset = model_data['body_offset']
     preset.body_rotation = model_data.get('body_rotation', (0.0, 0.0, 0.0))
+    preset.projector_location = model_data.get('projector_location', (0.0, 0.0, 0.0))
+    preset.projector_rotation = model_data.get('projector_rotation', (0.0, 0.0, 0.0))
+    preset.projector_scale = model_data.get('projector_scale', (1.0, 1.0, 1.0))
     preset.emitter_offset = model_data['emitter_offset']
     preset.emitter_rotation = model_data['emitter_rotation']
     preset.power = model_data['power']
     preset.throw_ratio = model_data['throw_ratio']
     preset.h_shift = model_data['h_shift']
     preset.v_shift = model_data['v_shift']
+    preset.resolution = model_data.get('resolution', '1920x1080')
+    preset.use_custom_texture_res = model_data.get('use_custom_texture_res', True)
+    preset.projected_texture = model_data.get('projected_texture', Textures.CHECKER.value)
+    preset.projected_color = model_data.get('projected_color', (1.0, 1.0, 1.0))
+    preset.show_pixel_grid = model_data.get('show_pixel_grid', False)
     preset.projection_cone_enabled = model_data.get('projection_cone_enabled', False)
     preset.projection_cone_length = model_data.get('projection_cone_length', 3.0)
     preset.body_mesh_vertices_json = model_data.get('body_mesh_vertices_json', '')
     preset.body_mesh_faces_json = model_data.get('body_mesh_faces_json', '')
+    preset.body_mesh_material_indices_json = model_data.get('body_mesh_material_indices_json', '')
+    preset.body_materials_json = model_data.get('body_materials_json', '')
     _write_models_store(prefs)
     return True
 
@@ -1307,22 +1600,7 @@ class PROJECTOR_OT_create_projector(Operator):
             if prefs is not None:
                 try:
                     preset = prefs.projector_models[int(self.saved_model)]
-                    model_data = {
-                        'body_type': preset.body_type,
-                        'body_dimensions': tuple(preset.body_dimensions),
-                        'body_offset': tuple(preset.body_offset),
-                        'body_rotation': tuple(preset.body_rotation),
-                        'emitter_offset': tuple(preset.emitter_offset),
-                        'emitter_rotation': tuple(preset.emitter_rotation),
-                        'power': preset.power,
-                        'throw_ratio': preset.throw_ratio,
-                        'h_shift': preset.h_shift,
-                        'v_shift': preset.v_shift,
-                        'projection_cone_enabled': preset.projection_cone_enabled,
-                        'projection_cone_length': preset.projection_cone_length,
-                        'body_mesh_vertices_json': preset.body_mesh_vertices_json,
-                        'body_mesh_faces_json': preset.body_mesh_faces_json,
-                    }
+                    model_data = _model_data_from_preset(preset)
                 except (ValueError, IndexError):
                     pass
 
@@ -1332,16 +1610,26 @@ class PROJECTOR_OT_create_projector(Operator):
                 'body_dimensions': (self.body_x, self.body_y, self.body_z),
                 'body_offset': tuple(self.body_offset),
                 'body_rotation': tuple(self.body_rotation),
+                'projector_location': tuple(projector.location),
+                'projector_rotation': tuple(projector.rotation_euler),
+                'projector_scale': tuple(projector.scale),
                 'emitter_offset': tuple(self.emitter_offset),
                 'emitter_rotation': tuple(self.emitter_rotation),
                 'power': self.power,
                 'throw_ratio': self.throw_ratio,
                 'h_shift': self.h_shift,
                 'v_shift': self.v_shift,
+                'resolution': '1920x1080',
+                'use_custom_texture_res': True,
+                'projected_texture': Textures.CHECKER.value,
+                'projected_color': random_color(),
+                'show_pixel_grid': False,
                 'projection_cone_enabled': getattr(self, 'projection_cone_enabled', False),
                 'projection_cone_length': getattr(self, 'projection_cone_length', 3.0),
                 'body_mesh_vertices_json': '',
                 'body_mesh_faces_json': '',
+                'body_mesh_material_indices_json': '',
+                'body_materials_json': '',
             }
 
         _apply_model_to_projector(projector, model_data)
@@ -1357,6 +1645,8 @@ class PROJECTOR_OT_create_projector(Operator):
                 projector,
                 model_data.get('body_mesh_vertices_json', ''),
                 model_data.get('body_mesh_faces_json', ''),
+                model_data.get('body_mesh_material_indices_json', ''),
+                model_data.get('body_materials_json', ''),
             )
             if restored is not None:
                 restored.location = Vector(model_data['body_offset'])
@@ -1401,16 +1691,26 @@ def _model_data_from_settings(settings):
         'throw_ratio': settings.throw_ratio,
         'h_shift': settings.h_shift,
         'v_shift': settings.v_shift,
+        'resolution': settings.resolution,
+        'use_custom_texture_res': settings.use_custom_texture_res,
+        'projected_texture': settings.projected_texture,
+        'projected_color': tuple(settings.projected_color),
+        'show_pixel_grid': settings.show_pixel_grid,
         'projection_cone_enabled': settings.projection_cone_enabled,
         'projection_cone_length': settings.projection_cone_length,
         'body_mesh_vertices_json': '',
         'body_mesh_faces_json': '',
+        'body_mesh_material_indices_json': '',
+        'body_materials_json': '',
     }
 
 
 def _model_data_from_projector(projector):
     settings = projector.proj_settings
     data = _model_data_from_settings(settings)
+    data['projector_location'] = tuple(projector.location)
+    data['projector_rotation'] = tuple(projector.rotation_euler)
+    data['projector_scale'] = tuple(projector.scale)
     body = get_projector_body(projector)
     if body is None:
         return data
@@ -1426,9 +1726,11 @@ def _model_data_from_projector(projector):
             max(float(dims.y), 0.01),
             max(float(dims.z), 0.01),
         )
-        vertices_json, faces_json = _serialize_mesh_data(body)
+        vertices_json, faces_json, material_indices_json = _serialize_mesh_data(body)
         data['body_mesh_vertices_json'] = vertices_json
         data['body_mesh_faces_json'] = faces_json
+        data['body_mesh_material_indices_json'] = material_indices_json
+        data['body_materials_json'] = _serialize_body_materials(body)
 
     return data
 
@@ -1472,22 +1774,7 @@ class PROJECTOR_OT_apply_saved_model(Operator):
             self.report({'ERROR'}, 'Saved model not found.')
             return {'CANCELLED'}
 
-        model_data = {
-            'body_type': preset.body_type,
-            'body_dimensions': tuple(preset.body_dimensions),
-            'body_offset': tuple(preset.body_offset),
-            'body_rotation': tuple(preset.body_rotation),
-            'emitter_offset': tuple(preset.emitter_offset),
-            'emitter_rotation': tuple(preset.emitter_rotation),
-            'power': preset.power,
-            'throw_ratio': preset.throw_ratio,
-            'h_shift': preset.h_shift,
-            'v_shift': preset.v_shift,
-            'projection_cone_enabled': preset.projection_cone_enabled,
-            'projection_cone_length': preset.projection_cone_length,
-            'body_mesh_vertices_json': preset.body_mesh_vertices_json,
-            'body_mesh_faces_json': preset.body_mesh_faces_json,
-        }
+        model_data = _model_data_from_preset(preset)
         _apply_model_to_projector(projector, model_data)
         if model_data.get('body_mesh_vertices_json'):
             existing_body = get_projector_body(projector)
@@ -1500,6 +1787,8 @@ class PROJECTOR_OT_apply_saved_model(Operator):
                 projector,
                 model_data.get('body_mesh_vertices_json', ''),
                 model_data.get('body_mesh_faces_json', ''),
+                model_data.get('body_mesh_material_indices_json', ''),
+                model_data.get('body_materials_json', ''),
             )
             if restored is not None:
                 restored.location = Vector(model_data['body_offset'])
@@ -1546,6 +1835,139 @@ class PROJECTOR_OT_save_model_from_selected(Operator):
             self.report({'INFO'}, f'Saved model {self.manufacturer} - {self.model_name}')
             return {'FINISHED'}
         self.report({'WARNING'}, 'Model not saved. Fill manufacturer and model name.')
+        return {'CANCELLED'}
+
+
+def _restore_body_from_model_data(projector, model_data, source_body_obj=None, operator=None):
+    if model_data.get('body_mesh_vertices_json'):
+        existing_body = get_projector_body(projector)
+        if existing_body is not None:
+            old_mesh = existing_body.data
+            bpy.data.objects.remove(existing_body, do_unlink=True)
+            if old_mesh and old_mesh.users == 0:
+                bpy.data.meshes.remove(old_mesh, do_unlink=True)
+        restored = _create_body_from_mesh_data(
+            projector,
+            model_data.get('body_mesh_vertices_json', ''),
+            model_data.get('body_mesh_faces_json', ''),
+            model_data.get('body_mesh_material_indices_json', ''),
+            model_data.get('body_materials_json', ''),
+        )
+        if restored is not None:
+            restored.location = Vector(model_data['body_offset'])
+            restored.rotation_euler = Euler(model_data.get('body_rotation', (0.0, 0.0, 0.0)), 'XYZ')
+            projector.proj_settings.body_type = 'SELECTED_OBJECT'
+        else:
+            _apply_body(projector, projector.proj_settings)
+    elif model_data['body_type'] == 'SELECTED_OBJECT' and source_body_obj is not None:
+        try:
+            existing_body = get_projector_body(projector)
+            if existing_body is not None:
+                old_mesh = existing_body.data
+                bpy.data.objects.remove(existing_body, do_unlink=True)
+                if old_mesh and old_mesh.users == 0:
+                    bpy.data.meshes.remove(old_mesh, do_unlink=True)
+            body = _set_body_from_object(source_body_obj, projector)
+            body.location = Vector(model_data['body_offset'])
+        except RuntimeError as exc:
+            if operator is not None:
+                operator.report({'WARNING'}, f'{exc} Using default body instead.')
+            projector.proj_settings.body_type = 'DEFAULT_BOX'
+            _apply_body(projector, projector.proj_settings)
+    else:
+        _apply_body(projector, projector.proj_settings)
+
+    _apply_emitter_transform(projector, projector.proj_settings)
+    _apply_projection_cone(projector, projector.proj_settings)
+
+
+def _create_projector_from_model_data(context, model_data):
+    projector = create_projector(context)
+    init_projector(projector.proj_settings, context)
+    _apply_model_to_projector(projector, model_data)
+    _restore_body_from_model_data(projector, model_data)
+    return projector
+
+
+class PROJECTOR_OT_save_all_projectors(Operator):
+    bl_idname = 'projector.save_all_projectors'
+    bl_label = 'Save All Projectors'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    manufacturer: bpy.props.StringProperty(name='Manufacturer', default='Scene')
+
+    @classmethod
+    def poll(cls, context):
+        return bool(get_projectors(context, only_selected=False))
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        layout.prop(self, 'manufacturer')
+
+    def execute(self, context):
+        projectors = get_projectors(context, only_selected=False)
+        saved_count = 0
+        for projector in projectors:
+            model_data = _model_data_from_projector(projector)
+            model_name = projector.name
+            if _store_model_preset_from_data(self.manufacturer, model_name, model_data):
+                saved_count += 1
+
+        if saved_count == 0:
+            self.report({'WARNING'}, 'No projectors were saved.')
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f'Saved {saved_count} projectors.')
+        return {'FINISHED'}
+
+
+class PROJECTOR_OT_load_all_saved_projectors(Operator):
+    bl_idname = 'projector.load_all_saved_projectors'
+    bl_label = 'Load All Saved Projectors'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        prefs = get_addon_preferences()
+        return prefs is not None and len(prefs.projector_models) > 0 and context.mode == 'OBJECT'
+
+    def execute(self, context):
+        prefs = get_addon_preferences()
+        if prefs is None:
+            return {'CANCELLED'}
+
+        created_count = 0
+        for preset in prefs.projector_models:
+            projector = _create_projector_from_model_data(context, _model_data_from_preset(preset))
+            projector.name = f'Projector.{preset.manufacturer}.{preset.model_name}'
+            created_count += 1
+
+        if created_count == 0:
+            self.report({'WARNING'}, 'No saved projectors found.')
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f'Loaded {created_count} saved projectors.')
+        return {'FINISHED'}
+
+
+class PROJECTOR_OT_reload_saved_models(Operator):
+    bl_idname = 'projector.reload_saved_models'
+    bl_label = 'Reload Saved Models'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if _load_models_store_into_preferences():
+            prefs = get_addon_preferences()
+            count = len(prefs.projector_models) if prefs is not None else 0
+            self.report({'INFO'}, f'Reloaded {count} saved models.')
+            return {'FINISHED'}
+
+        self.report({'WARNING'}, 'No saved model store found.')
         return {'CANCELLED'}
 
 
@@ -1682,9 +2104,7 @@ class PROJECTOR_OT_export_all_projection_cones(Operator):
         return {'FINISHED'}
 
 
-def update_projected_texture(proj_settings, context):
-    """ Update the projected output source. """
-    projector = get_projector(context)
+def _apply_projected_texture_to_projector(projector, proj_settings):
     if projector is None:
         return
     spot = get_projector_spot(projector)
@@ -1711,6 +2131,11 @@ def update_projected_texture(proj_settings, context):
         custom_tex_node = root_tree.nodes['Image Texture']
         root_tree.links.new(
             custom_tex_node.outputs[0], emission_node.inputs[0])
+
+
+def update_projected_texture(proj_settings, context):
+    """ Update the projected output source. """
+    _apply_projected_texture_to_projector(get_projector(context), proj_settings)
 
 
 class PROJECTOR_OT_delete_projector(Operator):
@@ -1848,6 +2273,9 @@ def register():
     _safe_register_class(PROJECTOR_OT_create_projector)
     _safe_register_class(PROJECTOR_OT_apply_saved_model)
     _safe_register_class(PROJECTOR_OT_save_model_from_selected)
+    _safe_register_class(PROJECTOR_OT_save_all_projectors)
+    _safe_register_class(PROJECTOR_OT_load_all_saved_projectors)
+    _safe_register_class(PROJECTOR_OT_reload_saved_models)
     _safe_register_class(PROJECTOR_OT_delete_saved_model)
     _safe_register_class(PROJECTOR_OT_export_projection_cone)
     _safe_register_class(PROJECTOR_OT_export_all_projection_cones)
@@ -1856,14 +2284,21 @@ def register():
     _load_models_store_into_preferences()
     bpy.types.Object.proj_settings = bpy.props.PointerProperty(
         type=ProjectorSettings)
+    if _ensure_duplicated_projectors_are_independent not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_ensure_duplicated_projectors_are_independent)
 
 
 def unregister():
+    if _ensure_duplicated_projectors_are_independent in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_ensure_duplicated_projectors_are_independent)
     if hasattr(bpy.types.Object, 'proj_settings'):
         del bpy.types.Object.proj_settings
     _safe_unregister_class(PROJECTOR_OT_change_color_randomly)
     _safe_unregister_class(PROJECTOR_OT_delete_projector)
     _safe_unregister_class(PROJECTOR_OT_delete_saved_model)
+    _safe_unregister_class(PROJECTOR_OT_reload_saved_models)
+    _safe_unregister_class(PROJECTOR_OT_load_all_saved_projectors)
+    _safe_unregister_class(PROJECTOR_OT_save_all_projectors)
     _safe_unregister_class(PROJECTOR_OT_save_model_from_selected)
     _safe_unregister_class(PROJECTOR_OT_export_all_projection_cones)
     _safe_unregister_class(PROJECTOR_OT_export_projection_cone)

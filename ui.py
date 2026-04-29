@@ -74,11 +74,6 @@ class PROJECTOR_PT_projector_settings(Panel):
             row_cone.operator('projector.export_projection_cone', text='Copy This Cone')
             row_cone.operator('projector.export_all_projection_cones', text='Copy All Cones')
 
-            layout.separator()
-            layout.label(text='Saved Models:')
-            model_box = layout.box()
-            model_box.operator('projector.save_model_from_selected', text='Save Current')
-
             # Custom Texture
             if proj_settings.projected_texture == Textures.CUSTOM_TEXTURE.value:
                 box = layout.box()
@@ -88,6 +83,15 @@ class PROJECTOR_PT_projector_settings(Panel):
                 if spot:
                     node = spot.data.node_tree.nodes['Image Texture']
                     box.template_image(node, 'image', node.image_user, compact=False)
+
+        layout.separator()
+        layout.label(text='Saved Models:')
+        model_box = layout.box()
+        model_box.operator('projector.save_model_from_selected', text='Save Current')
+        row_saved = model_box.row(align=True)
+        row_saved.operator('projector.save_all_projectors', text='Save All')
+        row_saved.operator('projector.load_all_saved_projectors', text='Load All')
+        model_box.operator('projector.reload_saved_models', text='Refresh Saved List')
 
 
 class PROJECTOR_PT_projected_color(Panel):
