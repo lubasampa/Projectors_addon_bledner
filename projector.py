@@ -120,19 +120,17 @@ def _read_models_store():
     return models if isinstance(models, list) else []
 
 
-def _load_models_store_into_preferences(prefs=None):
-    prefs = prefs or get_addon_preferences()
-    if prefs is None:
-        return False
+def _models_from_payload(payload):
+    if isinstance(payload, dict):
+        models = payload.get('models', [])
+    elif isinstance(payload, list):
+        models = payload
+    else:
+        models = []
+    return models if isinstance(models, list) else []
 
-    stored_models = _read_models_store()
-    if stored_models is None:
-        # Migration path: if only Blender preferences contain models, bootstrap JSON storage.
-        if len(prefs.projector_models) > 0:
-            _write_models_store(prefs)
-            return True
-        return False
 
+def _populate_preferences_from_model_data(prefs, stored_models):
     _clear_projector_models(prefs)
     for data in stored_models:
         if not isinstance(data, dict):
@@ -183,6 +181,22 @@ def _load_models_store_into_preferences(prefs=None):
         preset.body_mesh_material_indices_json = str(data.get('body_mesh_material_indices_json', ''))
         preset.body_materials_json = str(data.get('body_materials_json', ''))
     return True
+
+
+def _load_models_store_into_preferences(prefs=None):
+    prefs = prefs or get_addon_preferences()
+    if prefs is None:
+        return False
+
+    stored_models = _read_models_store()
+    if stored_models is None:
+        # Migration path: if only Blender preferences contain models, bootstrap JSON storage.
+        if len(prefs.projector_models) > 0:
+            _write_models_store(prefs)
+            return True
+        return False
+
+    return _populate_preferences_from_model_data(prefs, stored_models)
 
 
 def _safe_register_class(cls):
@@ -1971,6 +1985,96 @@ class PROJECTOR_OT_reload_saved_models(Operator):
         return {'CANCELLED'}
 
 
+class PROJECTOR_OT_export_saved_models(Operator):
+    bl_idname = 'projector.export_saved_models'
+    bl_label = 'Export Saved Library'
+    bl_options = {'REGISTER'}
+
+    filepath: bpy.props.StringProperty(
+        name='File Path',
+        default='projector_saved_models.json',
+        subtype='FILE_PATH')
+
+    @classmethod
+    def poll(cls, context):
+        prefs = get_addon_preferences()
+        return prefs is not None and len(prefs.projector_models) > 0
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        prefs = get_addon_preferences()
+        if prefs is None:
+            return {'CANCELLED'}
+
+        filepath = self.filepath
+        if not filepath:
+            self.report({'WARNING'}, 'Choose a JSON file path.')
+            return {'CANCELLED'}
+        if not filepath.lower().endswith('.json'):
+            filepath = f'{filepath}.json'
+
+        payload = {
+            'version': 1,
+            'models': _serialize_models_from_preferences(prefs),
+        }
+        try:
+            output_dir = os.path.dirname(filepath)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+            with open(filepath, 'w', encoding='utf-8') as handle:
+                json.dump(payload, handle, ensure_ascii=True, indent=2)
+        except OSError:
+            log.exception('Failed to export projector model library: %s', filepath)
+            self.report({'ERROR'}, 'Failed to export saved projector library.')
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f'Exported {len(payload["models"])} saved models.')
+        return {'FINISHED'}
+
+
+class PROJECTOR_OT_import_saved_models(Operator):
+    bl_idname = 'projector.import_saved_models'
+    bl_label = 'Import Saved Library'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filepath: bpy.props.StringProperty(
+        name='File Path',
+        subtype='FILE_PATH')
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        prefs = get_addon_preferences()
+        if prefs is None:
+            return {'CANCELLED'}
+        if not self.filepath:
+            self.report({'WARNING'}, 'Choose a saved projector JSON file.')
+            return {'CANCELLED'}
+
+        try:
+            with open(self.filepath, 'r', encoding='utf-8') as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            log.exception('Failed to import projector model library: %s', self.filepath)
+            self.report({'ERROR'}, 'Failed to import saved projector library.')
+            return {'CANCELLED'}
+
+        stored_models = _models_from_payload(payload)
+        if not stored_models:
+            self.report({'WARNING'}, 'No saved projector models found in this file.')
+            return {'CANCELLED'}
+
+        _populate_preferences_from_model_data(prefs, stored_models)
+        _write_models_store(prefs)
+        self.report({'INFO'}, f'Imported {len(prefs.projector_models)} saved models.')
+        return {'FINISHED'}
+
+
 class PROJECTOR_OT_delete_saved_model(Operator):
     bl_idname = 'projector.delete_saved_model'
     bl_label = 'Delete Saved Model'
@@ -2276,6 +2380,8 @@ def register():
     _safe_register_class(PROJECTOR_OT_save_all_projectors)
     _safe_register_class(PROJECTOR_OT_load_all_saved_projectors)
     _safe_register_class(PROJECTOR_OT_reload_saved_models)
+    _safe_register_class(PROJECTOR_OT_export_saved_models)
+    _safe_register_class(PROJECTOR_OT_import_saved_models)
     _safe_register_class(PROJECTOR_OT_delete_saved_model)
     _safe_register_class(PROJECTOR_OT_export_projection_cone)
     _safe_register_class(PROJECTOR_OT_export_all_projection_cones)
@@ -2296,6 +2402,8 @@ def unregister():
     _safe_unregister_class(PROJECTOR_OT_change_color_randomly)
     _safe_unregister_class(PROJECTOR_OT_delete_projector)
     _safe_unregister_class(PROJECTOR_OT_delete_saved_model)
+    _safe_unregister_class(PROJECTOR_OT_import_saved_models)
+    _safe_unregister_class(PROJECTOR_OT_export_saved_models)
     _safe_unregister_class(PROJECTOR_OT_reload_saved_models)
     _safe_unregister_class(PROJECTOR_OT_load_all_saved_projectors)
     _safe_unregister_class(PROJECTOR_OT_save_all_projectors)

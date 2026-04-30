@@ -91,6 +91,9 @@ class PROJECTOR_PT_projector_settings(Panel):
         row_saved = model_box.row(align=True)
         row_saved.operator('projector.save_all_projectors', text='Save All')
         row_saved.operator('projector.load_all_saved_projectors', text='Load All')
+        row_library = model_box.row(align=True)
+        row_library.operator('projector.export_saved_models', text='Export Library')
+        row_library.operator('projector.import_saved_models', text='Import Library')
         model_box.operator('projector.reload_saved_models', text='Refresh Saved List')
 
 

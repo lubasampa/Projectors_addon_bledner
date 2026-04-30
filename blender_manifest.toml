@@ -17,6 +17,7 @@ copyright = ["2024 Jonas Schell"]
 [build]
 paths_exclude_pattern = [
     "__pycache__/",
+    ".codex",
     ".git/",
     "*.zip",
     ".gitignore",
