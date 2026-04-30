@@ -1263,7 +1263,7 @@ def _apply_projection_cone(projector, proj_settings):
     if cone is None:
         cone = bpy.data.objects.new('Projector.Cone', mesh)
         cone[PROJECTOR_CONE_TAG] = True
-        cone.parent = spot
+        cone.parent = projector
         cone.matrix_parent_inverse.identity()
         target_collection = projector.users_collection[0] if projector.users_collection else bpy.context.scene.collection
         target_collection.objects.link(cone)
@@ -1272,13 +1272,14 @@ def _apply_projection_cone(projector, proj_settings):
         _remove_all_projector_cones(projector)
         cone = bpy.data.objects.new('Projector.Cone', mesh)
         cone[PROJECTOR_CONE_TAG] = True
-        cone.parent = spot
+        cone.parent = projector
         cone.matrix_parent_inverse.identity()
         target_collection = projector.users_collection[0] if projector.users_collection else bpy.context.scene.collection
         target_collection.objects.link(cone)
 
-    cone.location = (0.0, 0.0, 0.0)
-    cone.rotation_euler = Euler((0.0, 0.0, 0.0), 'XYZ')
+    cone.location = Vector(spot.location)
+    cone.rotation_euler = spot.rotation_euler.copy()
+    cone.scale = (1.0, 1.0, 1.0)
     cone.hide_render = False
     cone.hide_viewport = False
     cone.hide_select = True
