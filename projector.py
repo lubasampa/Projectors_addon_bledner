@@ -1089,8 +1089,6 @@ def _cone_length_meters(proj_settings, scene=None):
     # Older UI unit handling could store scene units while the add-on logic expected meters.
     if scale != 1.0 and value > 20.0:
         return _scene_units_to_meters(value, scene)
-    if value > 20.0:
-        return value / 100.0
     return value
 
 
@@ -3211,6 +3209,7 @@ class ProjectorSettings(bpy.types.PropertyGroup):
         name='Cone Length (m)',
         default=3.0,
         min=0.2,
+        soft_max=100.0,
         update=update_projection_cone)
     projection_info_enabled: bpy.props.BoolProperty(
         name='Show Screen Info',
