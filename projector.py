@@ -1071,6 +1071,35 @@ def _meters_to_scene_units(value_m, scene=None):
     return value_m / scale
 
 
+def _scene_units_to_meters(value, scene=None):
+    scene = scene or bpy.context.scene
+    scale = 1.0
+    if scene is not None and scene.unit_settings is not None:
+        scale = scene.unit_settings.scale_length if scene.unit_settings.scale_length > 0 else 1.0
+    return value * scale
+
+
+def _cone_length_meters(proj_settings, scene=None):
+    value = max(float(proj_settings.projection_cone_length), 0.0)
+    scene = scene or bpy.context.scene
+    scale = 1.0
+    if scene is not None and scene.unit_settings is not None:
+        scale = scene.unit_settings.scale_length if scene.unit_settings.scale_length > 0 else 1.0
+
+    # Older UI unit handling could store scene units while the add-on logic expected meters.
+    if scale != 1.0 and value > 20.0:
+        return _scene_units_to_meters(value, scene)
+    return value
+
+
+def _normalize_cone_length_property(proj_settings, scene=None):
+    value = max(float(proj_settings.projection_cone_length), 0.0)
+    normalized = _cone_length_meters(proj_settings, scene)
+    if abs(value - normalized) > 0.0001:
+        proj_settings.projection_cone_length = normalized
+    return normalized
+
+
 def _get_or_create_cone_material():
     mat = bpy.data.materials.get('_Projector.ConeMaterial')
     if mat is None:
@@ -1115,7 +1144,7 @@ def _projection_screen_metrics(projector, proj_settings):
     res_w, res_h = _get_resolution_for_projector(projector, proj_settings)
     aspect = max(res_w / max(res_h, 1.0), 0.01)
     throw_ratio = max(proj_settings.throw_ratio, 0.1)
-    length_m = max(proj_settings.projection_cone_length, 0.0)
+    length_m = _cone_length_meters(proj_settings)
     width_m = length_m / throw_ratio if length_m > 0.0 else 0.0
     height_m = width_m / aspect if width_m > 0.0 else 0.0
     area_m2 = width_m * height_m
@@ -1131,7 +1160,7 @@ def _apply_projection_info(projector, proj_settings, screen_width_units, screen_
     if (
         not proj_settings.projection_cone_enabled
         or not proj_settings.projection_info_enabled
-        or proj_settings.projection_cone_length <= 0.0
+        or _cone_length_meters(proj_settings) <= 0.0
     ):
         _remove_all_projector_cone_infos(projector)
         return
@@ -1161,9 +1190,9 @@ def _apply_projection_info(projector, proj_settings, screen_width_units, screen_
     )
     curve.align_x = 'LEFT'
     curve.align_y = 'CENTER'
-    curve.size = max(min(screen_width_units * 0.08, _meters_to_scene_units(0.25)), _meters_to_scene_units(0.06))
+    curve.size = max(min(screen_width_units * 0.18, _meters_to_scene_units(0.8)), _meters_to_scene_units(0.18))
 
-    margin = max(screen_width_units * 0.08, _meters_to_scene_units(0.08))
+    margin = max(screen_width_units * 0.12, _meters_to_scene_units(0.25))
     info.location = (
         (screen_width_units * 0.5) + margin,
         screen_height_units * 0.25,
@@ -1202,7 +1231,7 @@ def _apply_projection_cone(projector, proj_settings):
     res_w, res_h = _get_resolution_for_projector(projector, proj_settings)
     aspect = max(res_w / max(res_h, 1.0), 0.01)
     throw_ratio = max(proj_settings.throw_ratio, 0.1)
-    length_m = max(proj_settings.projection_cone_length, 0.0)
+    length_m = _normalize_cone_length_property(proj_settings)
     if length_m <= 0.0:
         _remove_all_projector_cones(projector)
         _remove_all_projector_cone_infos(projector)
@@ -3172,11 +3201,9 @@ class ProjectorSettings(bpy.types.PropertyGroup):
         default=False,
         update=update_projection_cone)
     projection_cone_length: bpy.props.FloatProperty(
-        name='Cone Length',
+        name='Cone Length (m)',
         default=3.0,
         min=0.2,
-        subtype='DISTANCE',
-        unit='LENGTH',
         update=update_projection_cone)
     projection_info_enabled: bpy.props.BoolProperty(
         name='Show Screen Info',
