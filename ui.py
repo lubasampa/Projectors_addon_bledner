@@ -89,7 +89,8 @@ class PROJECTOR_PT_projector_settings(Panel):
             array_box = layout.box()
             row_array = array_box.row(align=True)
             row_array.operator('projector.create_array', text='Create Array')
-            row_array.operator('projector.make_array_independent', text='Make Independent')
+            row_array.operator('projector.edit_array', text='Edit Array')
+            array_box.operator('projector.make_array_independent', text='Make Independent')
 
         layout.separator()
         layout.label(text='Saved Models:')

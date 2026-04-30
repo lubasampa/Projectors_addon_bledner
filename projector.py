@@ -22,8 +22,12 @@ PROJECTOR_BODY_TAG = ADDON_ID.format('body')
 PROJECTOR_CONE_TAG = ADDON_ID.format('projection_cone')
 PROJECTOR_INSTANCE_TAG = ADDON_ID.format('instance_id')
 PROJECTOR_ARRAY_SOURCE_TAG = ADDON_ID.format('array_source')
+PROJECTOR_ARRAY_SOURCE_ID_TAG = ADDON_ID.format('array_source_id')
 PROJECTOR_ARRAY_LINKED_TAG = ADDON_ID.format('array_linked')
 PROJECTOR_ARRAY_STATE_TAG = ADDON_ID.format('array_source_state')
+PROJECTOR_ARRAY_CONTROLLER_TAG = ADDON_ID.format('array_controller')
+PROJECTOR_ARRAY_INDEX_TAG = ADDON_ID.format('array_index')
+PROJECTOR_ARRAY_SETTINGS_TAG = ADDON_ID.format('array_settings')
 MODELS_STORE_FILENAME = 'projector_saved_models.json'
 _PROJECTOR_DUPLICATE_HANDLER_RUNNING = False
 _PROJECTOR_DUPLICATE_REFRESH_PENDING = set()
@@ -1836,42 +1840,261 @@ def _model_settings_signature(model_data):
     return json.dumps(settings_data, sort_keys=True, ensure_ascii=True)
 
 
+def _array_settings_signature(settings):
+    return json.dumps(settings, sort_keys=True, ensure_ascii=True)
+
+
+def _array_settings_from_source(source):
+    raw_settings = source.get(PROJECTOR_ARRAY_SETTINGS_TAG, '')
+    if not raw_settings:
+        return None
+    try:
+        settings = json.loads(raw_settings)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return settings if isinstance(settings, dict) else None
+
+
+def _array_total_count(settings):
+    if settings.get('mode') == 'GRID':
+        return max(int(settings.get('columns', 1)), 1) * max(int(settings.get('rows', 1)), 1)
+    return max(int(settings.get('count', 2)), 2)
+
+
+def _find_projector_by_instance_id(scene, instance_id):
+    if not instance_id:
+        return None
+    for obj in scene.objects:
+        if obj.type == 'CAMERA' and obj.get(PROJECTOR_INSTANCE_TAG, '') == instance_id:
+            return obj
+    return None
+
+
+def _array_source_for_projector(scene, projector):
+    source_id = projector.get(PROJECTOR_ARRAY_SOURCE_ID_TAG, '')
+    source = _find_projector_by_instance_id(scene, source_id)
+    if source is not None:
+        return source
+
+    source_name = projector.get(PROJECTOR_ARRAY_SOURCE_TAG, '')
+    source = bpy.data.objects.get(source_name)
+    if source is not None and source.type == 'CAMERA':
+        return source
+    return None
+
+
+def _array_controller_source_from_context(context):
+    projector = get_projector(context)
+    if projector is None:
+        return None
+    if projector.get(PROJECTOR_ARRAY_CONTROLLER_TAG, False):
+        return projector
+    if projector.get(PROJECTOR_ARRAY_LINKED_TAG, False):
+        return _array_source_for_projector(context.scene, projector)
+    return None
+
+
+def _linked_array_children(scene, source):
+    source_id = source.get(PROJECTOR_INSTANCE_TAG, '')
+    children = []
+    for obj in scene.objects:
+        if obj == source or not obj.get(PROJECTOR_ARRAY_LINKED_TAG, False):
+            continue
+        if obj.get(PROJECTOR_ARRAY_SOURCE_ID_TAG, '') == source_id:
+            children.append(obj)
+        elif obj.get(PROJECTOR_ARRAY_SOURCE_TAG, '') == source.name:
+            children.append(obj)
+    return sorted(children, key=lambda child: int(child.get(PROJECTOR_ARRAY_INDEX_TAG, 0)))
+
+
+def _array_transform_for_index(source, settings, index):
+    base_location = Vector(source.location)
+    base_rotation = source.rotation_euler.copy()
+    base_scale = Vector(source.scale)
+    rotation_matrix = base_rotation.to_matrix()
+    mode = settings.get('mode', 'LINEAR')
+
+    if mode == 'GRID':
+        columns = max(int(settings.get('columns', 1)), 1)
+        column = index % columns
+        row = index // columns
+        column_offset = Vector(settings.get('offset', (1.0, 0.0, 0.0)))
+        row_offset = Vector(settings.get('row_offset', (0.0, 1.0, 0.0)))
+        local_offset = (column_offset * column) + (row_offset * row)
+        return base_location + rotation_matrix @ local_offset, base_rotation, base_scale
+
+    if mode == 'RADIAL':
+        total = _array_total_count(settings)
+        arc = float(settings.get('radial_arc', math.tau))
+        start = float(settings.get('radial_start_angle', 0.0))
+        is_full_circle = abs(abs(arc) - math.tau) < 0.0001
+        step = arc / total if is_full_circle else arc / max(total - 1, 1)
+        radius = _meters_to_scene_units(float(settings.get('radial_radius', 2.0)))
+        source_offset = Vector((
+            math.cos(start) * radius,
+            math.sin(start) * radius,
+            0.0,
+        ))
+        center = base_location - (rotation_matrix @ source_offset)
+        angle = start + (step * index)
+        local_offset = Vector((
+            math.cos(angle) * radius,
+            math.sin(angle) * radius,
+            0.0,
+        ))
+        rotation = base_rotation.copy()
+        if bool(settings.get('rotate_radial_projectors', True)):
+            rotation.rotate_axis('Z', step * index)
+        return center + rotation_matrix @ local_offset, rotation, base_scale
+
+    offset = Vector(settings.get('offset', (1.0, 0.0, 0.0)))
+    return base_location + rotation_matrix @ (offset * index), base_rotation, base_scale
+
+
+def _apply_source_state_to_array_child(source_data, source_signature, projector, location, rotation, scale):
+    model_data = dict(source_data)
+    model_data['projector_location'] = tuple(location)
+    model_data['projector_rotation'] = tuple(rotation)
+    model_data['projector_scale'] = tuple(scale)
+    _apply_model_to_projector(projector, model_data)
+    _restore_body_from_model_data(projector, model_data)
+    projector.location = Vector(location)
+    projector.rotation_euler = Euler(rotation, 'XYZ')
+    projector.scale = Vector(scale)
+    _refresh_projector_derived_state(projector)
+    projector[PROJECTOR_ARRAY_STATE_TAG] = source_signature
+
+
+def _configure_array_child(projector, source, index, source_signature):
+    projector[PROJECTOR_ARRAY_LINKED_TAG] = True
+    projector[PROJECTOR_ARRAY_SOURCE_TAG] = source.name
+    projector[PROJECTOR_ARRAY_SOURCE_ID_TAG] = source.get(PROJECTOR_INSTANCE_TAG, '')
+    projector[PROJECTOR_ARRAY_INDEX_TAG] = int(index)
+    projector[PROJECTOR_ARRAY_STATE_TAG] = source_signature
+
+
+def _settings_from_array_operator(operator):
+    return {
+        'mode': operator.array_mode,
+        'count': int(operator.count),
+        'columns': int(operator.columns),
+        'rows': int(operator.rows),
+        'offset': list(operator.offset),
+        'row_offset': list(operator.row_offset),
+        'radial_radius': float(operator.radial_radius),
+        'radial_arc': float(operator.radial_arc),
+        'radial_start_angle': float(operator.radial_start_angle),
+        'rotate_radial_projectors': bool(operator.rotate_radial_projectors),
+    }
+
+
+def _apply_array_settings_to_operator(operator, settings):
+    operator.array_mode = settings.get('mode', operator.array_mode)
+    operator.count = int(settings.get('count', operator.count))
+    operator.columns = int(settings.get('columns', operator.columns))
+    operator.rows = int(settings.get('rows', operator.rows))
+    operator.offset = settings.get('offset', tuple(operator.offset))
+    operator.row_offset = settings.get('row_offset', tuple(operator.row_offset))
+    operator.radial_radius = float(settings.get('radial_radius', operator.radial_radius))
+    operator.radial_arc = float(settings.get('radial_arc', operator.radial_arc))
+    operator.radial_start_angle = float(settings.get('radial_start_angle', operator.radial_start_angle))
+    operator.rotate_radial_projectors = bool(
+        settings.get('rotate_radial_projectors', operator.rotate_radial_projectors))
+
+
+def _remove_projector_hierarchy(projector):
+    stack = list(projector.children)
+    descendants = []
+    while stack:
+        child = stack.pop()
+        descendants.append(child)
+        stack.extend(child.children)
+    for child in descendants:
+        bpy.data.objects.remove(child, do_unlink=True)
+    bpy.data.objects.remove(projector, do_unlink=True)
+
+
+def _rebuild_projector_array(context, source, settings, operator=None):
+    model_data = _model_data_from_projector(source)
+    source_signature = _model_settings_signature(model_data)
+    total = _array_total_count(settings)
+    existing_children = {
+        int(child.get(PROJECTOR_ARRAY_INDEX_TAG, 0)): child
+        for child in _linked_array_children(context.scene, source)
+        if int(child.get(PROJECTOR_ARRAY_INDEX_TAG, 0)) > 0
+    }
+    created_count = 0
+
+    source[PROJECTOR_ARRAY_CONTROLLER_TAG] = True
+    source[PROJECTOR_ARRAY_SETTINGS_TAG] = _array_settings_signature(settings)
+
+    for index in range(1, total):
+        location, rotation, scale = _array_transform_for_index(source, settings, index)
+        projector = existing_children.pop(index, None)
+        if projector is None:
+            copy_data = dict(model_data)
+            copy_data['projector_location'] = tuple(location)
+            copy_data['projector_rotation'] = tuple(rotation)
+            copy_data['projector_scale'] = tuple(scale)
+            projector = _create_projector_from_model_data(context, copy_data)
+            projector.name = f'{source.name}.Array'
+            projector[PROJECTOR_INSTANCE_TAG] = _new_projector_instance_id()
+            created_count += 1
+        _configure_array_child(projector, source, index, source_signature)
+        _apply_source_state_to_array_child(model_data, source_signature, projector, location, rotation, scale)
+
+    removed_count = 0
+    for projector in existing_children.values():
+        _remove_projector_hierarchy(projector)
+        removed_count += 1
+
+    if operator is not None:
+        operator.report({'INFO'}, f'Array updated. Created {created_count}, removed {removed_count}.')
+
+    return created_count, removed_count
+
+
 def _sync_linked_projector_arrays(scene):
     source_states = {}
     for projector in scene.objects:
         if not projector.get(PROJECTOR_ARRAY_LINKED_TAG, False):
             continue
 
-        source_name = projector.get(PROJECTOR_ARRAY_SOURCE_TAG, '')
-        source = bpy.data.objects.get(source_name)
+        source = _array_source_for_projector(scene, projector)
         if source is None or source == projector or not hasattr(source, 'proj_settings'):
             continue
 
+        source_name = source.name
         if source_name not in source_states:
             source_data = _model_data_from_projector(source)
             source_states[source_name] = (
                 source_data,
                 _model_settings_signature(source_data),
+                _array_settings_from_source(source),
             )
 
-        source_data, source_signature = source_states[source_name]
-        if projector.get(PROJECTOR_ARRAY_STATE_TAG, '') == source_signature:
-            continue
+        source_data, source_signature, settings = source_states[source_name]
+        if settings is not None and PROJECTOR_ARRAY_INDEX_TAG in projector:
+            target_location, target_rotation, target_scale = _array_transform_for_index(
+                source, settings, int(projector.get(PROJECTOR_ARRAY_INDEX_TAG, 0)))
+        else:
+            target_location = tuple(projector.location)
+            target_rotation = tuple(projector.rotation_euler)
+            target_scale = tuple(projector.scale)
 
-        target_location = tuple(projector.location)
-        target_rotation = tuple(projector.rotation_euler)
-        target_scale = tuple(projector.scale)
-        model_data = dict(source_data)
-        model_data['projector_location'] = target_location
-        model_data['projector_rotation'] = target_rotation
-        model_data['projector_scale'] = target_scale
-        _apply_model_to_projector(projector, model_data)
-        _restore_body_from_model_data(projector, model_data)
-        projector.location = Vector(target_location)
-        projector.rotation_euler = Euler(target_rotation, 'XYZ')
-        projector.scale = Vector(target_scale)
-        _refresh_projector_derived_state(projector)
-        projector[PROJECTOR_ARRAY_STATE_TAG] = source_signature
+        has_state_change = projector.get(PROJECTOR_ARRAY_STATE_TAG, '') != source_signature
+        has_transform_change = (
+            tuple(projector.location) != tuple(target_location)
+            or tuple(projector.rotation_euler) != tuple(target_rotation)
+            or tuple(projector.scale) != tuple(target_scale)
+        )
+        if has_state_change:
+            _apply_source_state_to_array_child(
+                source_data, source_signature, projector, target_location, target_rotation, target_scale)
+        elif has_transform_change:
+            projector.location = Vector(target_location)
+            projector.rotation_euler = Euler(target_rotation, 'XYZ')
+            projector.scale = Vector(target_scale)
 
 
 class PROJECTOR_OT_apply_saved_model(Operator):
@@ -2115,11 +2338,23 @@ class PROJECTOR_OT_create_projector_array(Operator):
         if source is None:
             return {'CANCELLED'}
 
+        settings = _settings_from_array_operator(self)
+        if self.keep_settings_linked:
+            _rebuild_projector_array(context, source, settings)
+            created = _linked_array_children(context.scene, source)
+            bpy.ops.object.select_all(action='DESELECT')
+            source.select_set(True)
+            for projector in created:
+                projector.select_set(True)
+            context.view_layer.objects.active = source
+            self.report({'INFO'}, f'Created {len(created)} linked array projectors.')
+            return {'FINISHED'}
+
         model_data = _model_data_from_projector(source)
-        source_state = _model_settings_signature(model_data)
         created = []
 
-        for location, rotation, scale in self._array_transforms(source):
+        for index in range(1, _array_total_count(settings)):
+            location, rotation, scale = _array_transform_for_index(source, settings, index)
             copy_data = dict(model_data)
             copy_data['projector_location'] = tuple(location)
             copy_data['projector_rotation'] = tuple(rotation)
@@ -2127,10 +2362,6 @@ class PROJECTOR_OT_create_projector_array(Operator):
             projector = _create_projector_from_model_data(context, copy_data)
             projector.name = f'{source.name}.Array'
             projector[PROJECTOR_INSTANCE_TAG] = _new_projector_instance_id()
-            if self.keep_settings_linked:
-                projector[PROJECTOR_ARRAY_LINKED_TAG] = True
-                projector[PROJECTOR_ARRAY_SOURCE_TAG] = source.name
-                projector[PROJECTOR_ARRAY_STATE_TAG] = source_state
             _refresh_projector_derived_state(projector)
             created.append(projector)
 
@@ -2144,8 +2375,102 @@ class PROJECTOR_OT_create_projector_array(Operator):
             projector.select_set(True)
         context.view_layer.objects.active = source
 
-        linked_label = ' linked' if self.keep_settings_linked else ''
-        self.report({'INFO'}, f'Created {len(created)}{linked_label} array projectors.')
+        self.report({'INFO'}, f'Created {len(created)} array projectors.')
+        return {'FINISHED'}
+
+
+class PROJECTOR_OT_edit_projector_array(Operator):
+    bl_idname = 'projector.edit_array'
+    bl_label = 'Edit Projector Array'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    array_mode: bpy.props.EnumProperty(
+        name='Mode',
+        items=[
+            ('LINEAR', 'Linear', 'Create a line of projectors'),
+            ('GRID', 'Grid', 'Create rows and columns of projectors'),
+            ('RADIAL', 'Radial', 'Create projectors around an arc or circle'),
+        ],
+        default='LINEAR')
+    count: bpy.props.IntProperty(name='Count', default=3, min=2)
+    columns: bpy.props.IntProperty(name='Columns', default=3, min=1)
+    rows: bpy.props.IntProperty(name='Rows', default=2, min=1)
+    offset: bpy.props.FloatVectorProperty(
+        name='Offset',
+        size=3,
+        default=(1.0, 0.0, 0.0),
+        subtype='TRANSLATION')
+    row_offset: bpy.props.FloatVectorProperty(
+        name='Row Offset',
+        size=3,
+        default=(0.0, 1.0, 0.0),
+        subtype='TRANSLATION')
+    radial_radius: bpy.props.FloatProperty(
+        name='Radius',
+        default=2.0,
+        min=0.0,
+        subtype='DISTANCE',
+        unit='LENGTH')
+    radial_arc: bpy.props.FloatProperty(
+        name='Arc',
+        default=math.tau,
+        min=-math.tau,
+        max=math.tau,
+        subtype='ANGLE',
+        unit='ROTATION')
+    radial_start_angle: bpy.props.FloatProperty(
+        name='Start Angle',
+        default=0.0,
+        subtype='ANGLE',
+        unit='ROTATION')
+    rotate_radial_projectors: bpy.props.BoolProperty(name='Rotate Along Arc', default=True)
+
+    @classmethod
+    def poll(cls, context):
+        return _array_controller_source_from_context(context) is not None and context.mode == 'OBJECT'
+
+    def invoke(self, context, event):
+        source = _array_controller_source_from_context(context)
+        if source is None:
+            return {'CANCELLED'}
+        settings = _array_settings_from_source(source)
+        if settings is not None:
+            _apply_array_settings_to_operator(self, settings)
+        self.keep_settings_linked = True
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        layout.prop(self, 'array_mode')
+
+        if self.array_mode == 'LINEAR':
+            layout.prop(self, 'count')
+            layout.prop(self, 'offset')
+        elif self.array_mode == 'GRID':
+            layout.prop(self, 'columns')
+            layout.prop(self, 'rows')
+            layout.prop(self, 'offset', text='Column Offset')
+            layout.prop(self, 'row_offset')
+        else:
+            layout.prop(self, 'count')
+            layout.prop(self, 'radial_radius')
+            layout.prop(self, 'radial_arc')
+            layout.prop(self, 'radial_start_angle')
+            layout.prop(self, 'rotate_radial_projectors')
+
+    def execute(self, context):
+        source = _array_controller_source_from_context(context)
+        if source is None:
+            return {'CANCELLED'}
+        settings = _settings_from_array_operator(self)
+        _rebuild_projector_array(context, source, settings, self)
+        bpy.ops.object.select_all(action='DESELECT')
+        source.select_set(True)
+        for projector in _linked_array_children(context.scene, source):
+            projector.select_set(True)
+        context.view_layer.objects.active = source
         return {'FINISHED'}
 
 
@@ -2158,19 +2483,36 @@ class PROJECTOR_OT_make_array_independent(Operator):
     def poll(cls, context):
         return any(
             projector.get(PROJECTOR_ARRAY_LINKED_TAG, False)
+            or projector.get(PROJECTOR_ARRAY_CONTROLLER_TAG, False)
             for projector in get_projectors(context, only_selected=True)
         )
 
     def execute(self, context):
         count = 0
+        keys = (
+            PROJECTOR_ARRAY_LINKED_TAG,
+            PROJECTOR_ARRAY_SOURCE_TAG,
+            PROJECTOR_ARRAY_SOURCE_ID_TAG,
+            PROJECTOR_ARRAY_STATE_TAG,
+            PROJECTOR_ARRAY_CONTROLLER_TAG,
+            PROJECTOR_ARRAY_INDEX_TAG,
+            PROJECTOR_ARRAY_SETTINGS_TAG,
+        )
         for projector in get_projectors(context, only_selected=True):
+            if projector.get(PROJECTOR_ARRAY_CONTROLLER_TAG, False):
+                for child in _linked_array_children(context.scene, projector):
+                    for key in keys:
+                        if key in child:
+                            del child[key]
+                    count += 1
+                for key in keys:
+                    if key in projector:
+                        del projector[key]
+                continue
+
             if not projector.get(PROJECTOR_ARRAY_LINKED_TAG, False):
                 continue
-            for key in (
-                PROJECTOR_ARRAY_LINKED_TAG,
-                PROJECTOR_ARRAY_SOURCE_TAG,
-                PROJECTOR_ARRAY_STATE_TAG,
-            ):
+            for key in keys:
                 if key in projector:
                     del projector[key]
             count += 1
@@ -2643,6 +2985,7 @@ def register():
     _safe_register_class(PROJECTOR_OT_apply_saved_model)
     _safe_register_class(PROJECTOR_OT_save_model_from_selected)
     _safe_register_class(PROJECTOR_OT_create_projector_array)
+    _safe_register_class(PROJECTOR_OT_edit_projector_array)
     _safe_register_class(PROJECTOR_OT_make_array_independent)
     _safe_register_class(PROJECTOR_OT_reload_saved_models)
     _safe_register_class(PROJECTOR_OT_export_saved_models)
@@ -2671,6 +3014,7 @@ def unregister():
     _safe_unregister_class(PROJECTOR_OT_export_saved_models)
     _safe_unregister_class(PROJECTOR_OT_reload_saved_models)
     _safe_unregister_class(PROJECTOR_OT_make_array_independent)
+    _safe_unregister_class(PROJECTOR_OT_edit_projector_array)
     _safe_unregister_class(PROJECTOR_OT_create_projector_array)
     _safe_unregister_class(PROJECTOR_OT_save_model_from_selected)
     _safe_unregister_class(PROJECTOR_OT_export_all_projection_cones)
