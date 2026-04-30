@@ -84,6 +84,13 @@ class PROJECTOR_PT_projector_settings(Panel):
                     node = spot.data.node_tree.nodes['Image Texture']
                     box.template_image(node, 'image', node.image_user, compact=False)
 
+            layout.separator()
+            layout.label(text='Projector Array:')
+            array_box = layout.box()
+            row_array = array_box.row(align=True)
+            row_array.operator('projector.create_array', text='Create Array')
+            row_array.operator('projector.make_array_independent', text='Make Independent')
+
         layout.separator()
         layout.label(text='Saved Models:')
         model_box = layout.box()
