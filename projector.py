@@ -23,6 +23,8 @@ PROJECTOR_CONE_TAG = ADDON_ID.format('projection_cone')
 PROJECTOR_INSTANCE_TAG = ADDON_ID.format('instance_id')
 MODELS_STORE_FILENAME = 'projector_saved_models.json'
 _PROJECTOR_DUPLICATE_HANDLER_RUNNING = False
+_PROJECTOR_DUPLICATE_REFRESH_PENDING = set()
+_PROJECTOR_DUPLICATE_REFRESH_SCHEDULED = False
 
 
 def _get_models_store_path():
@@ -327,6 +329,42 @@ def _ensure_projector_hierarchy(projector):
         _apply_projection_cone(projector, projector.proj_settings)
 
 
+def _refresh_duplicated_projector_cones():
+    global _PROJECTOR_DUPLICATE_HANDLER_RUNNING
+    global _PROJECTOR_DUPLICATE_REFRESH_SCHEDULED
+
+    pending_names = list(_PROJECTOR_DUPLICATE_REFRESH_PENDING)
+    _PROJECTOR_DUPLICATE_REFRESH_PENDING.clear()
+    _PROJECTOR_DUPLICATE_REFRESH_SCHEDULED = False
+
+    _PROJECTOR_DUPLICATE_HANDLER_RUNNING = True
+    try:
+        for name in pending_names:
+            projector = bpy.data.objects.get(name)
+            if projector is None or not hasattr(projector, 'proj_settings'):
+                continue
+            _ensure_projector_hierarchy(projector)
+            _make_projector_datablocks_local(projector)
+            _apply_emitter_transform(projector, projector.proj_settings)
+            _apply_projection_cone(projector, projector.proj_settings)
+    finally:
+        _PROJECTOR_DUPLICATE_HANDLER_RUNNING = False
+
+    return None
+
+
+def _queue_projector_cone_refresh(projector):
+    global _PROJECTOR_DUPLICATE_REFRESH_SCHEDULED
+
+    if projector is None:
+        return
+
+    _PROJECTOR_DUPLICATE_REFRESH_PENDING.add(projector.name)
+    if not _PROJECTOR_DUPLICATE_REFRESH_SCHEDULED:
+        _PROJECTOR_DUPLICATE_REFRESH_SCHEDULED = True
+        bpy.app.timers.register(_refresh_duplicated_projector_cones, first_interval=0.1)
+
+
 @persistent
 def _ensure_duplicated_projectors_are_independent(scene, depsgraph=None):
     global _PROJECTOR_DUPLICATE_HANDLER_RUNNING
@@ -340,16 +378,25 @@ def _ensure_duplicated_projectors_are_independent(scene, depsgraph=None):
             obj for obj in scene.objects
             if obj.type == 'CAMERA' and obj.name.startswith('Projector') and hasattr(obj, 'proj_settings')
         ]
+        instance_counts = {}
+        for projector in projectors:
+            instance_id = projector.get(PROJECTOR_INSTANCE_TAG)
+            if instance_id:
+                instance_counts[instance_id] = instance_counts.get(instance_id, 0) + 1
+
         for projector in projectors:
             _ensure_projector_hierarchy(projector)
             instance_id = projector.get(PROJECTOR_INSTANCE_TAG)
             is_new_instance = not instance_id or instance_id in used_ids
+            has_duplicated_id = instance_id and instance_counts.get(instance_id, 0) > 1
             if is_new_instance:
                 projector[PROJECTOR_INSTANCE_TAG] = _new_projector_instance_id()
                 _make_projector_datablocks_local(projector)
-                _apply_projection_cone(projector, projector.proj_settings)
+                _queue_projector_cone_refresh(projector)
             else:
                 _make_projector_datablocks_local(projector)
+                if has_duplicated_id:
+                    _queue_projector_cone_refresh(projector)
             used_ids.add(projector[PROJECTOR_INSTANCE_TAG])
     finally:
         _PROJECTOR_DUPLICATE_HANDLER_RUNNING = False
