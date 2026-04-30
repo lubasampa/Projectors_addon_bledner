@@ -343,10 +343,7 @@ def _refresh_duplicated_projector_cones():
             projector = bpy.data.objects.get(name)
             if projector is None or not hasattr(projector, 'proj_settings'):
                 continue
-            _ensure_projector_hierarchy(projector)
-            _make_projector_datablocks_local(projector)
-            _apply_emitter_transform(projector, projector.proj_settings)
-            _apply_projection_cone(projector, projector.proj_settings)
+            _refresh_projector_derived_state(projector)
     finally:
         _PROJECTOR_DUPLICATE_HANDLER_RUNNING = False
 
@@ -1216,6 +1213,68 @@ def _apply_throw_ratio_to_projector(projector, proj_settings):
     _apply_projection_cone(projector, proj_settings)
 
 
+def _apply_pixel_grid_to_projector(projector, proj_settings):
+    spot = get_projector_spot(projector)
+    if spot is None:
+        return
+    root_tree = spot.data.node_tree
+    nodes = root_tree.nodes
+    pixel_grid_nodes = nodes['pixel_grid'].node_tree.nodes
+    width, height = _get_resolution_for_projector(projector, proj_settings)
+    pixel_grid_nodes['_width'].outputs[0].default_value = width
+    pixel_grid_nodes['_height'].outputs[0].default_value = height
+    if proj_settings.show_pixel_grid:
+        root_tree.links.new(nodes['pixel_grid'].outputs[0], nodes['Light Output'].inputs[0])
+    else:
+        root_tree.links.new(nodes['Emission'].outputs[0], nodes['Light Output'].inputs[0])
+
+
+def _apply_checker_color_to_projector(projector, proj_settings):
+    spot = get_projector_spot(projector)
+    if spot is None:
+        return
+    nodes = spot.data.node_tree.nodes['Group'].node_tree.nodes
+    c = proj_settings.projected_color
+    nodes['Checker Texture'].inputs['Color2'].default_value = [c.r, c.g, c.b, 1]
+
+
+def _apply_power_to_projector(projector, proj_settings):
+    spot = get_projector_spot(projector)
+    if spot is None:
+        return
+    if proj_settings.projection_cone_enabled:
+        spot.data.energy = 0.0
+    else:
+        spot.data.energy = proj_settings["power"]
+
+
+def _apply_resolution_to_projector(projector, proj_settings):
+    spot = get_projector_spot(projector)
+    if spot is None:
+        return
+    nodes = spot.data.node_tree.nodes['Group'].node_tree.nodes
+    nodes['Image Texture'].image = bpy.data.images[f'_proj.tex.{proj_settings.resolution}']
+    _apply_throw_ratio_to_projector(projector, proj_settings)
+    _apply_pixel_grid_to_projector(projector, proj_settings)
+    _apply_projection_cone(projector, proj_settings)
+
+
+def _refresh_projector_derived_state(projector):
+    if projector is None or not hasattr(projector, 'proj_settings'):
+        return
+
+    proj_settings = projector.proj_settings
+    _ensure_projector_hierarchy(projector)
+    _make_projector_datablocks_local(projector)
+    _apply_emitter_transform(projector, proj_settings)
+    _apply_resolution_to_projector(projector, proj_settings)
+    _apply_projected_texture_to_projector(projector, proj_settings)
+    _apply_checker_color_to_projector(projector, proj_settings)
+    _apply_power_to_projector(projector, proj_settings)
+    _apply_body(projector, proj_settings)
+    _apply_projection_cone(projector, proj_settings)
+
+
 def update_throw_ratio(proj_settings, context):
     """
     Adjust some settings on a camera to achieve a throw ratio
@@ -1232,59 +1291,28 @@ def update_lens_shift(proj_settings, context):
     """
     projector = get_projector(context)
     _apply_lens_shift_to_projector(projector, proj_settings)
-    update_projection_cone(proj_settings, context)
+    _apply_projection_cone(projector, proj_settings)
 
 
 def update_resolution(proj_settings, context):
     projector = get_projector(context)
-    spot = get_projector_spot(projector)
-    if spot is None:
-        return
-    nodes = spot.data.node_tree.nodes['Group'].node_tree.nodes
-    # Change resolution image texture
-    nodes['Image Texture'].image = bpy.data.images[f'_proj.tex.{proj_settings.resolution}']
-    update_throw_ratio(proj_settings, context)
-    update_pixel_grid(proj_settings, context)
-    update_projection_cone(proj_settings, context)
+    _apply_resolution_to_projector(projector, proj_settings)
 
 
 def update_checker_color(proj_settings, context):
     # Update checker texture color
     projector = get_projector(context)
-    spot = get_projector_spot(projector)
-    if spot is None:
-        return
-    nodes = spot.data.node_tree.nodes['Group'].node_tree.nodes
-    c = proj_settings.projected_color
-    nodes['Checker Texture'].inputs['Color2'].default_value = [c.r, c.g, c.b, 1]
+    _apply_checker_color_to_projector(projector, proj_settings)
 
 
 def update_power(proj_settings, context):
     projector = get_projector(context)
-    spot = get_projector_spot(projector)
-    if spot is None or projector is None:
-        return
-    if proj_settings.projection_cone_enabled:
-        spot.data.energy = 0.0
-    else:
-        spot.data.energy = proj_settings["power"]
+    _apply_power_to_projector(projector, proj_settings)
 
 
 def update_pixel_grid(proj_settings, context):
     """ Update the pixel grid. Meaning, make it visible by linking the right node and updating the resolution. """
-    spot = get_projector_spot(get_projector(context))
-    if spot is None:
-        return
-    root_tree = spot.data.node_tree
-    nodes = root_tree.nodes
-    pixel_grid_nodes = nodes['pixel_grid'].node_tree.nodes
-    width, height = get_resolution(proj_settings, context)
-    pixel_grid_nodes['_width'].outputs[0].default_value = width
-    pixel_grid_nodes['_height'].outputs[0].default_value = height
-    if proj_settings.show_pixel_grid:
-        root_tree.links.new(nodes['pixel_grid'].outputs[0], nodes['Light Output'].inputs[0])
-    else:
-        root_tree.links.new(nodes['Emission'].outputs[0], nodes['Light Output'].inputs[0])
+    _apply_pixel_grid_to_projector(get_projector(context), proj_settings)
 
     
 def create_pixel_grid_node_group():
