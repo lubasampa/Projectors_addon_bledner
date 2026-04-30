@@ -1903,72 +1903,6 @@ def _create_projector_from_model_data(context, model_data):
     return projector
 
 
-class PROJECTOR_OT_save_all_projectors(Operator):
-    bl_idname = 'projector.save_all_projectors'
-    bl_label = 'Save All Projectors'
-    bl_options = {'REGISTER', 'UNDO'}
-
-    manufacturer: bpy.props.StringProperty(name='Manufacturer', default='Scene')
-
-    @classmethod
-    def poll(cls, context):
-        return bool(get_projectors(context, only_selected=False))
-
-    def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self, width=360)
-
-    def draw(self, context):
-        layout = self.layout
-        layout.use_property_split = True
-        layout.use_property_decorate = False
-        layout.prop(self, 'manufacturer')
-
-    def execute(self, context):
-        projectors = get_projectors(context, only_selected=False)
-        saved_count = 0
-        for projector in projectors:
-            model_data = _model_data_from_projector(projector)
-            model_name = projector.name
-            if _store_model_preset_from_data(self.manufacturer, model_name, model_data):
-                saved_count += 1
-
-        if saved_count == 0:
-            self.report({'WARNING'}, 'No projectors were saved.')
-            return {'CANCELLED'}
-
-        self.report({'INFO'}, f'Saved {saved_count} projectors.')
-        return {'FINISHED'}
-
-
-class PROJECTOR_OT_load_all_saved_projectors(Operator):
-    bl_idname = 'projector.load_all_saved_projectors'
-    bl_label = 'Load All Saved Projectors'
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        prefs = get_addon_preferences()
-        return prefs is not None and len(prefs.projector_models) > 0 and context.mode == 'OBJECT'
-
-    def execute(self, context):
-        prefs = get_addon_preferences()
-        if prefs is None:
-            return {'CANCELLED'}
-
-        created_count = 0
-        for preset in prefs.projector_models:
-            projector = _create_projector_from_model_data(context, _model_data_from_preset(preset))
-            projector.name = f'Projector.{preset.manufacturer}.{preset.model_name}'
-            created_count += 1
-
-        if created_count == 0:
-            self.report({'WARNING'}, 'No saved projectors found.')
-            return {'CANCELLED'}
-
-        self.report({'INFO'}, f'Loaded {created_count} saved projectors.')
-        return {'FINISHED'}
-
-
 class PROJECTOR_OT_reload_saved_models(Operator):
     bl_idname = 'projector.reload_saved_models'
     bl_label = 'Reload Saved Models'
@@ -2377,8 +2311,6 @@ def register():
     _safe_register_class(PROJECTOR_OT_create_projector)
     _safe_register_class(PROJECTOR_OT_apply_saved_model)
     _safe_register_class(PROJECTOR_OT_save_model_from_selected)
-    _safe_register_class(PROJECTOR_OT_save_all_projectors)
-    _safe_register_class(PROJECTOR_OT_load_all_saved_projectors)
     _safe_register_class(PROJECTOR_OT_reload_saved_models)
     _safe_register_class(PROJECTOR_OT_export_saved_models)
     _safe_register_class(PROJECTOR_OT_import_saved_models)
@@ -2405,8 +2337,6 @@ def unregister():
     _safe_unregister_class(PROJECTOR_OT_import_saved_models)
     _safe_unregister_class(PROJECTOR_OT_export_saved_models)
     _safe_unregister_class(PROJECTOR_OT_reload_saved_models)
-    _safe_unregister_class(PROJECTOR_OT_load_all_saved_projectors)
-    _safe_unregister_class(PROJECTOR_OT_save_all_projectors)
     _safe_unregister_class(PROJECTOR_OT_save_model_from_selected)
     _safe_unregister_class(PROJECTOR_OT_export_all_projection_cones)
     _safe_unregister_class(PROJECTOR_OT_export_projection_cone)
