@@ -347,6 +347,7 @@ def _ensure_duplicated_projectors_are_independent(scene, depsgraph=None):
             if is_new_instance:
                 projector[PROJECTOR_INSTANCE_TAG] = _new_projector_instance_id()
                 _make_projector_datablocks_local(projector)
+                _apply_projection_cone(projector, projector.proj_settings)
             else:
                 _make_projector_datablocks_local(projector)
             used_ids.add(projector[PROJECTOR_INSTANCE_TAG])
