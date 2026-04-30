@@ -8,7 +8,7 @@ from enum import Enum
 import bpy
 from bpy.app.handlers import persistent
 from bpy.types import AddonPreferences, Operator, PropertyGroup
-from mathutils import Euler, Vector
+from mathutils import Euler, Matrix, Vector
 
 from .helper import (ADDON_ID, auto_offset,
                      get_projectors, get_projector, random_color)
@@ -1948,7 +1948,7 @@ def _array_transform_for_index(source, settings, index):
         ))
         rotation = base_rotation.copy()
         if bool(settings.get('rotate_radial_projectors', True)):
-            rotation.rotate_axis('Z', step * index)
+            rotation = (Matrix.Rotation(step * index, 3, 'Z') @ base_rotation.to_matrix()).to_euler('XYZ')
         return center + local_offset, rotation, base_scale
 
     offset = Vector(settings.get('offset', (1.0, 0.0, 0.0)))
@@ -2352,7 +2352,7 @@ class PROJECTOR_OT_create_projector_array(Operator):
                 ))
                 rotation = base_rotation.copy()
                 if self.rotate_radial_projectors:
-                    rotation.rotate_axis('Z', step * index)
+                    rotation = (Matrix.Rotation(step * index, 3, 'Z') @ base_rotation.to_matrix()).to_euler('XYZ')
                 yield (
                     center + rotation_matrix @ local_offset,
                     rotation,
@@ -2806,10 +2806,47 @@ def _export_independent_cone_copy(cone, name, target_collection):
     return obj
 
 
+def _create_random_cone_copy_material(name):
+    mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+
+    out = nodes.new('ShaderNodeOutputMaterial')
+    bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+    color = random_color(alpha=True)
+    color[3] = 0.25
+    mat.diffuse_color = color
+    bsdf.inputs['Base Color'].default_value = color
+    bsdf.inputs['Alpha'].default_value = 0.25
+    bsdf.inputs['Roughness'].default_value = 0.35
+    links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
+
+    mat.blend_method = 'BLEND'
+    if hasattr(mat, 'shadow_method'):
+        mat.shadow_method = 'NONE'
+    return mat
+
+
 class PROJECTOR_OT_export_all_projection_cones(Operator):
     bl_idname = 'projector.export_all_projection_cones'
     bl_label = 'Export All Cone Copies'
     bl_options = {'REGISTER', 'UNDO'}
+
+    randomize_colors: bpy.props.BoolProperty(
+        name='Randomize Colors',
+        description='Give each copied cone its own random transparent material',
+        default=False)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=320)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        layout.prop(self, 'randomize_colors')
 
     def execute(self, context):
         projectors = get_projectors(context, only_selected=False)
@@ -2831,6 +2868,12 @@ class PROJECTOR_OT_export_all_projection_cones(Operator):
             name = f'{projector.name}.ConeCopy'
             exported = _export_independent_cone_copy(cone, name, target_collection)
             if exported is not None:
+                if self.randomize_colors:
+                    mat = _create_random_cone_copy_material(f'{exported.name}.RandomMaterial')
+                    if exported.data.materials:
+                        exported.data.materials[0] = mat
+                    else:
+                        exported.data.materials.append(mat)
                 count += 1
 
         if count == 0:
