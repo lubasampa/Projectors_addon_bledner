@@ -32,6 +32,7 @@ MODELS_STORE_FILENAME = 'projector_saved_models.json'
 _PROJECTOR_DUPLICATE_HANDLER_RUNNING = False
 _PROJECTOR_DUPLICATE_REFRESH_PENDING = set()
 _PROJECTOR_DUPLICATE_REFRESH_SCHEDULED = False
+_PROJECTOR_ARRAY_SYNC_SCHEDULED = False
 
 
 def _get_models_store_path():
@@ -377,12 +378,9 @@ def _ensure_duplicated_projectors_are_independent(scene, depsgraph=None):
 
     _PROJECTOR_DUPLICATE_HANDLER_RUNNING = True
     try:
-        _sync_linked_projector_arrays(scene)
+        _queue_linked_projector_array_sync()
         used_ids = set()
-        projectors = [
-            obj for obj in scene.objects
-            if obj.type == 'CAMERA' and obj.name.startswith('Projector') and hasattr(obj, 'proj_settings')
-        ]
+        projectors = list(_iter_projector_objects(scene))
         instance_counts = {}
         for projector in projectors:
             instance_id = projector.get(PROJECTOR_INSTANCE_TAG)
@@ -1861,10 +1859,17 @@ def _array_total_count(settings):
     return max(int(settings.get('count', 2)), 2)
 
 
+def _iter_projector_objects(scene=None):
+    objects = bpy.data.objects if scene is None else scene.objects
+    for obj in list(objects):
+        if obj.type == 'CAMERA' and obj.name.startswith('Projector') and hasattr(obj, 'proj_settings'):
+            yield obj
+
+
 def _find_projector_by_instance_id(scene, instance_id):
     if not instance_id:
         return None
-    for obj in scene.objects:
+    for obj in _iter_projector_objects(scene):
         if obj.type == 'CAMERA' and obj.get(PROJECTOR_INSTANCE_TAG, '') == instance_id:
             return obj
     return None
@@ -2054,9 +2059,9 @@ def _rebuild_projector_array(context, source, settings, operator=None):
     return created_count, removed_count
 
 
-def _sync_linked_projector_arrays(scene):
+def _sync_linked_projector_arrays(scene=None):
     source_states = {}
-    for projector in scene.objects:
+    for projector in _iter_projector_objects(scene):
         if not projector.get(PROJECTOR_ARRAY_LINKED_TAG, False):
             continue
 
@@ -2095,6 +2100,28 @@ def _sync_linked_projector_arrays(scene):
             projector.location = Vector(target_location)
             projector.rotation_euler = Euler(target_rotation, 'XYZ')
             projector.scale = Vector(target_scale)
+
+
+def _sync_linked_projector_arrays_deferred():
+    global _PROJECTOR_DUPLICATE_HANDLER_RUNNING
+    global _PROJECTOR_ARRAY_SYNC_SCHEDULED
+
+    _PROJECTOR_ARRAY_SYNC_SCHEDULED = False
+    _PROJECTOR_DUPLICATE_HANDLER_RUNNING = True
+    try:
+        _sync_linked_projector_arrays()
+    finally:
+        _PROJECTOR_DUPLICATE_HANDLER_RUNNING = False
+
+    return None
+
+
+def _queue_linked_projector_array_sync():
+    global _PROJECTOR_ARRAY_SYNC_SCHEDULED
+
+    if not _PROJECTOR_ARRAY_SYNC_SCHEDULED:
+        _PROJECTOR_ARRAY_SYNC_SCHEDULED = True
+        bpy.app.timers.register(_sync_linked_projector_arrays_deferred, first_interval=0.05)
 
 
 class PROJECTOR_OT_apply_saved_model(Operator):
