@@ -1916,7 +1916,6 @@ def _array_transform_for_index(source, settings, index):
     base_location = Vector(source.location)
     base_rotation = source.rotation_euler.copy()
     base_scale = Vector(source.scale)
-    rotation_matrix = base_rotation.to_matrix()
     mode = settings.get('mode', 'LINEAR')
 
     if mode == 'GRID':
@@ -1926,7 +1925,7 @@ def _array_transform_for_index(source, settings, index):
         column_offset = Vector(settings.get('offset', (1.0, 0.0, 0.0)))
         row_offset = Vector(settings.get('row_offset', (0.0, 1.0, 0.0)))
         local_offset = (column_offset * column) + (row_offset * row)
-        return base_location + rotation_matrix @ local_offset, base_rotation, base_scale
+        return base_location + local_offset, base_rotation, base_scale
 
     if mode == 'RADIAL':
         total = _array_total_count(settings)
@@ -1940,7 +1939,7 @@ def _array_transform_for_index(source, settings, index):
             math.sin(start) * radius,
             0.0,
         ))
-        center = base_location - (rotation_matrix @ source_offset)
+        center = base_location - source_offset
         angle = start + (step * index)
         local_offset = Vector((
             math.cos(angle) * radius,
@@ -1950,10 +1949,10 @@ def _array_transform_for_index(source, settings, index):
         rotation = base_rotation.copy()
         if bool(settings.get('rotate_radial_projectors', True)):
             rotation.rotate_axis('Z', step * index)
-        return center + rotation_matrix @ local_offset, rotation, base_scale
+        return center + local_offset, rotation, base_scale
 
     offset = Vector(settings.get('offset', (1.0, 0.0, 0.0)))
-    return base_location + rotation_matrix @ (offset * index), base_rotation, base_scale
+    return base_location + (offset * index), base_rotation, base_scale
 
 
 def _apply_source_state_to_array_child(source_data, source_signature, projector, location, rotation, scale):
