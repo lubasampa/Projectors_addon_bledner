@@ -38,7 +38,7 @@ class PROJECTOR_PT_projector_settings(Panel):
             layout.label(text='Projector Settings:')
             box = layout.box()
             box.prop(proj_settings, 'throw_ratio')
-            box.prop(proj_settings, 'power', text='Power')
+            box.prop(proj_settings, 'power', text='Lumens')
             res_row = box.row()
             res_row.prop(proj_settings, 'resolution',
                          text='Resolution', icon='PRESET')
@@ -70,6 +70,7 @@ class PROJECTOR_PT_projector_settings(Panel):
             body_box.prop(proj_settings, 'projection_cone_enabled')
             if proj_settings.projection_cone_enabled:
                 body_box.prop(proj_settings, 'projection_cone_length')
+                body_box.prop(proj_settings, 'projection_info_enabled')
             row_cone = body_box.row(align=True)
             row_cone.operator('projector.export_projection_cone', text='Copy This Cone')
             row_cone.operator('projector.export_all_projection_cones', text='Copy All Cones')

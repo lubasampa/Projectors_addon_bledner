@@ -20,6 +20,7 @@ log = logging.getLogger(name=__file__)
 PROJECTOR_SPOT_TAG = ADDON_ID.format('spot')
 PROJECTOR_BODY_TAG = ADDON_ID.format('body')
 PROJECTOR_CONE_TAG = ADDON_ID.format('projection_cone')
+PROJECTOR_CONE_INFO_TAG = ADDON_ID.format('projection_cone_info')
 PROJECTOR_INSTANCE_TAG = ADDON_ID.format('instance_id')
 PROJECTOR_ARRAY_SOURCE_TAG = ADDON_ID.format('array_source')
 PROJECTOR_ARRAY_SOURCE_ID_TAG = ADDON_ID.format('array_source_id')
@@ -82,6 +83,7 @@ def _serialize_models_from_preferences(prefs):
             'show_pixel_grid': bool(preset.show_pixel_grid),
             'projection_cone_enabled': bool(preset.projection_cone_enabled),
             'projection_cone_length': float(preset.projection_cone_length),
+            'projection_info_enabled': bool(preset.projection_info_enabled),
             'body_mesh_vertices_json': preset.body_mesh_vertices_json,
             'body_mesh_faces_json': preset.body_mesh_faces_json,
             'body_mesh_material_indices_json': preset.body_mesh_material_indices_json,
@@ -174,6 +176,7 @@ def _populate_preferences_from_model_data(prefs, stored_models):
             preset.show_pixel_grid = bool(data.get('show_pixel_grid', False))
             preset.projection_cone_enabled = bool(data.get('projection_cone_enabled', False))
             preset.projection_cone_length = float(data.get('projection_cone_length', 3.0))
+            preset.projection_info_enabled = bool(data.get('projection_info_enabled', False))
         except (TypeError, ValueError):
             preset.power = 1000.0
             preset.throw_ratio = 0.8
@@ -186,6 +189,7 @@ def _populate_preferences_from_model_data(prefs, stored_models):
             preset.show_pixel_grid = False
             preset.projection_cone_enabled = False
             preset.projection_cone_length = 3.0
+            preset.projection_info_enabled = False
         preset.body_mesh_vertices_json = str(data.get('body_mesh_vertices_json', ''))
         preset.body_mesh_faces_json = str(data.get('body_mesh_faces_json', ''))
         preset.body_mesh_material_indices_json = str(data.get('body_mesh_material_indices_json', ''))
@@ -258,6 +262,18 @@ def get_projector_cone(projector):
     while stack:
         child = stack.pop()
         if child.get(PROJECTOR_CONE_TAG, False):
+            return child
+        stack.extend(child.children)
+    return None
+
+
+def get_projector_cone_info(projector):
+    if projector is None:
+        return None
+    stack = list(projector.children)
+    while stack:
+        child = stack.pop()
+        if child.get(PROJECTOR_CONE_INFO_TAG, False):
             return child
         stack.extend(child.children)
     return None
@@ -423,6 +439,24 @@ def _remove_all_projector_cones(projector):
             bpy.data.meshes.remove(old_mesh, do_unlink=True)
 
 
+def _remove_all_projector_cone_infos(projector):
+    if projector is None:
+        return
+    stack = list(projector.children)
+    to_remove = []
+    while stack:
+        child = stack.pop()
+        if child.get(PROJECTOR_CONE_INFO_TAG, False):
+            to_remove.append(child)
+        stack.extend(child.children)
+
+    for info in to_remove:
+        old_curve = info.data
+        bpy.data.objects.remove(info, do_unlink=True)
+        if old_curve and old_curve.users == 0:
+            bpy.data.curves.remove(old_curve, do_unlink=True)
+
+
 def get_addon_preferences(context=None):
     addon_name = __package__
     prefs_owner = None
@@ -502,7 +536,7 @@ class ProjectorModelPreset(PropertyGroup):
     projector_scale: bpy.props.FloatVectorProperty(name='Projector Scale', size=3, default=(1.0, 1.0, 1.0), subtype='XYZ')
     emitter_offset: bpy.props.FloatVectorProperty(name='Emitter Offset', size=3, default=(0.0, 0.0, 0.0), subtype='TRANSLATION')
     emitter_rotation: bpy.props.FloatVectorProperty(name='Emitter Rotation', size=3, default=(0.0, 0.0, 0.0), subtype='EULER', unit='ROTATION')
-    power: bpy.props.FloatProperty(name='Power', default=1000.0, min=0.0, soft_max=999999.0)
+    power: bpy.props.FloatProperty(name='Lumens', default=1000.0, min=0.0, soft_max=999999.0)
     throw_ratio: bpy.props.FloatProperty(name='Throw Ratio', default=0.8, min=0.1, soft_max=3.0)
     h_shift: bpy.props.FloatProperty(name='Horizontal Shift', default=0.0, soft_min=-20.0, soft_max=20.0)
     v_shift: bpy.props.FloatProperty(name='Vertical Shift', default=0.0, soft_min=-20.0, soft_max=20.0)
@@ -513,6 +547,7 @@ class ProjectorModelPreset(PropertyGroup):
     show_pixel_grid: bpy.props.BoolProperty(name='Show Pixel Grid', default=False)
     projection_cone_enabled: bpy.props.BoolProperty(name='Projection Cone', default=False)
     projection_cone_length: bpy.props.FloatProperty(name='Cone Length (m)', default=0.0, min=0.0)
+    projection_info_enabled: bpy.props.BoolProperty(name='Projection Info', default=False)
     body_mesh_vertices_json: bpy.props.StringProperty(name='Body Mesh Vertices', default='')
     body_mesh_faces_json: bpy.props.StringProperty(name='Body Mesh Faces', default='')
     body_mesh_material_indices_json: bpy.props.StringProperty(name='Body Mesh Material Indices', default='')
@@ -1058,6 +1093,94 @@ def _get_or_create_cone_material():
     return mat
 
 
+def _get_or_create_cone_info_material():
+    mat = bpy.data.materials.get('_Projector.ConeInfoMaterial')
+    if mat is None:
+        mat = bpy.data.materials.new('_Projector.ConeInfoMaterial')
+    mat.diffuse_color = (1.0, 1.0, 1.0, 1.0)
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+
+    out = nodes.new('ShaderNodeOutputMaterial')
+    emission = nodes.new('ShaderNodeEmission')
+    emission.inputs['Color'].default_value = (1.0, 1.0, 1.0, 1.0)
+    emission.inputs['Strength'].default_value = 1.0
+    links.new(emission.outputs['Emission'], out.inputs['Surface'])
+    return mat
+
+
+def _projection_screen_metrics(projector, proj_settings):
+    res_w, res_h = _get_resolution_for_projector(projector, proj_settings)
+    aspect = max(res_w / max(res_h, 1.0), 0.01)
+    throw_ratio = max(proj_settings.throw_ratio, 0.1)
+    length_m = max(proj_settings.projection_cone_length, 0.0)
+    width_m = length_m / throw_ratio if length_m > 0.0 else 0.0
+    height_m = width_m / aspect if width_m > 0.0 else 0.0
+    area_m2 = width_m * height_m
+    lumens = max(float(proj_settings.power), 0.0)
+    lux = lumens / area_m2 if area_m2 > 0.0 else 0.0
+    return width_m, height_m, area_m2, lumens, lux
+
+
+def _apply_projection_info(projector, proj_settings, screen_width_units, screen_height_units, length_units):
+    if projector is None:
+        return
+
+    if (
+        not proj_settings.projection_cone_enabled
+        or not proj_settings.projection_info_enabled
+        or proj_settings.projection_cone_length <= 0.0
+    ):
+        _remove_all_projector_cone_infos(projector)
+        return
+
+    spot = get_projector_spot(projector)
+    if spot is None:
+        return
+
+    info = get_projector_cone_info(projector)
+    if info is None:
+        curve = bpy.data.curves.new('Projector.ConeInfo', type='FONT')
+        info = bpy.data.objects.new('Projector.ConeInfo', curve)
+        info[PROJECTOR_CONE_INFO_TAG] = True
+        info.parent = spot
+        info.matrix_parent_inverse.identity()
+        target_collection = projector.users_collection[0] if projector.users_collection else bpy.context.scene.collection
+        target_collection.objects.link(info)
+    else:
+        curve = info.data
+
+    width_m, height_m, area_m2, lumens, lux = _projection_screen_metrics(projector, proj_settings)
+    curve.body = (
+        f'Screen: {width_m:.2f} m x {height_m:.2f} m\n'
+        f'Area: {area_m2:.2f} m2\n'
+        f'Output: {lumens:.0f} lm\n'
+        f'Illuminance: {lux:.0f} lux'
+    )
+    curve.align_x = 'LEFT'
+    curve.align_y = 'CENTER'
+    curve.size = max(min(screen_width_units * 0.08, _meters_to_scene_units(0.25)), _meters_to_scene_units(0.06))
+
+    margin = max(screen_width_units * 0.08, _meters_to_scene_units(0.08))
+    info.location = (
+        (screen_width_units * 0.5) + margin,
+        screen_height_units * 0.25,
+        -length_units,
+    )
+    info.rotation_euler = Euler((0.0, 0.0, 0.0), 'XYZ')
+    info.hide_render = False
+    info.hide_viewport = False
+    info.hide_select = True
+
+    mat = _get_or_create_cone_info_material()
+    if not curve.materials:
+        curve.materials.append(mat)
+    else:
+        curve.materials[0] = mat
+
+
 def _set_spot_enabled(projector, enabled):
     spot = get_projector_spot(projector)
     if spot is None:
@@ -1072,6 +1195,7 @@ def _apply_projection_cone(projector, proj_settings):
     cone = get_projector_cone(projector)
     if not proj_settings.projection_cone_enabled:
         _remove_all_projector_cones(projector)
+        _remove_all_projector_cone_infos(projector)
         _set_spot_enabled(projector, True)
         return
 
@@ -1081,6 +1205,7 @@ def _apply_projection_cone(projector, proj_settings):
     length_m = max(proj_settings.projection_cone_length, 0.0)
     if length_m <= 0.0:
         _remove_all_projector_cones(projector)
+        _remove_all_projector_cone_infos(projector)
         _set_spot_enabled(projector, False)
         return
     length = _meters_to_scene_units(length_m)
@@ -1129,6 +1254,7 @@ def _apply_projection_cone(projector, proj_settings):
         cone.data.materials.append(mat)
     else:
         cone.data.materials[0] = mat
+    _apply_projection_info(projector, proj_settings, width, height, length)
     _set_spot_enabled(projector, False)
 
 
@@ -1314,6 +1440,7 @@ def update_checker_color(proj_settings, context):
 def update_power(proj_settings, context):
     projector = get_projector(context)
     _apply_power_to_projector(projector, proj_settings)
+    _apply_projection_cone(projector, proj_settings)
 
 
 def update_pixel_grid(proj_settings, context):
@@ -1489,6 +1616,7 @@ def init_projector(proj_settings, context):
     proj_settings.emitter_rotation = (0.0, 0.0, 0.0)
     proj_settings.projection_cone_enabled = False
     proj_settings.projection_cone_length = 3.0
+    proj_settings.projection_info_enabled = False
 
     # Init Projector
     update_throw_ratio(proj_settings, context)
@@ -1523,6 +1651,7 @@ def _apply_model_to_projector(projector, model_data):
     settings.show_pixel_grid = model_data.get('show_pixel_grid', settings.show_pixel_grid)
     settings.projection_cone_enabled = model_data.get('projection_cone_enabled', False)
     settings.projection_cone_length = model_data.get('projection_cone_length', 3.0)
+    settings.projection_info_enabled = model_data.get('projection_info_enabled', False)
     settings.body_type = model_data['body_type']
     settings.body_dimensions = model_data['body_dimensions']
     settings.body_offset = model_data['body_offset']
@@ -1553,6 +1682,7 @@ def _model_data_from_preset(preset):
         'show_pixel_grid': preset.show_pixel_grid,
         'projection_cone_enabled': preset.projection_cone_enabled,
         'projection_cone_length': preset.projection_cone_length,
+        'projection_info_enabled': preset.projection_info_enabled,
         'body_mesh_vertices_json': preset.body_mesh_vertices_json,
         'body_mesh_faces_json': preset.body_mesh_faces_json,
         'body_mesh_material_indices_json': preset.body_mesh_material_indices_json,
@@ -1604,6 +1734,7 @@ def _store_model_preset_from_data(manufacturer, model_name, model_data):
     preset.show_pixel_grid = model_data.get('show_pixel_grid', False)
     preset.projection_cone_enabled = model_data.get('projection_cone_enabled', False)
     preset.projection_cone_length = model_data.get('projection_cone_length', 3.0)
+    preset.projection_info_enabled = model_data.get('projection_info_enabled', False)
     preset.body_mesh_vertices_json = model_data.get('body_mesh_vertices_json', '')
     preset.body_mesh_faces_json = model_data.get('body_mesh_faces_json', '')
     preset.body_mesh_material_indices_json = model_data.get('body_mesh_material_indices_json', '')
@@ -1627,12 +1758,13 @@ class PROJECTOR_OT_create_projector(Operator):
     emitter_offset: bpy.props.FloatVectorProperty(name='Emitter Offset', size=3, default=(0.0, 0.0, 0.0), subtype='TRANSLATION')
     emitter_rotation: bpy.props.FloatVectorProperty(name='Emitter Rotation', size=3, default=(0.0, 0.0, 0.0), subtype='EULER', unit='ROTATION')
 
-    power: bpy.props.FloatProperty(name='Power', default=1000.0, min=0.0, soft_max=999999.0)
+    power: bpy.props.FloatProperty(name='Lumens', default=1000.0, min=0.0, soft_max=999999.0)
     throw_ratio: bpy.props.FloatProperty(name='Throw Ratio', default=0.8, min=0.1, soft_max=3.0)
     h_shift: bpy.props.FloatProperty(name='Horizontal Shift', default=0.0, soft_min=-20.0, soft_max=20.0, subtype='PERCENTAGE')
     v_shift: bpy.props.FloatProperty(name='Vertical Shift', default=0.0, soft_min=-20.0, soft_max=20.0, subtype='PERCENTAGE')
     projection_cone_enabled: bpy.props.BoolProperty(name='Show Projection Cone', default=False)
     projection_cone_length: bpy.props.FloatProperty(name='Cone Length (m)', default=0.0, min=0.0)
+    projection_info_enabled: bpy.props.BoolProperty(name='Show Screen Info', default=False)
 
     use_saved_model: bpy.props.BoolProperty(name='Use Saved Model', default=False)
     saved_model: bpy.props.EnumProperty(name='Saved Model', items=_model_preset_items)
@@ -1677,10 +1809,11 @@ class PROJECTOR_OT_create_projector(Operator):
         beam.prop(self, 'projection_cone_enabled')
         if getattr(self, 'projection_cone_enabled', False):
             beam.prop(self, 'projection_cone_length')
+            beam.prop(self, 'projection_info_enabled')
 
         proj = layout.box()
         proj.label(text='Projector Settings')
-        proj.prop(self, 'power')
+        proj.prop(self, 'power', text='Lumens')
         proj.prop(self, 'throw_ratio')
         proj.prop(self, 'h_shift')
         proj.prop(self, 'v_shift')
@@ -1722,6 +1855,7 @@ class PROJECTOR_OT_create_projector(Operator):
                 'show_pixel_grid': False,
                 'projection_cone_enabled': getattr(self, 'projection_cone_enabled', False),
                 'projection_cone_length': getattr(self, 'projection_cone_length', 3.0),
+                'projection_info_enabled': getattr(self, 'projection_info_enabled', False),
                 'body_mesh_vertices_json': '',
                 'body_mesh_faces_json': '',
                 'body_mesh_material_indices_json': '',
@@ -1794,6 +1928,7 @@ def _model_data_from_settings(settings):
         'show_pixel_grid': settings.show_pixel_grid,
         'projection_cone_enabled': settings.projection_cone_enabled,
         'projection_cone_length': settings.projection_cone_length,
+        'projection_info_enabled': settings.projection_info_enabled,
         'body_mesh_vertices_json': '',
         'body_mesh_faces_json': '',
         'body_mesh_material_indices_json': '',
@@ -2956,10 +3091,9 @@ class ProjectorSettings(bpy.types.PropertyGroup):
         update=update_throw_ratio,
         subtype='FACTOR')
     power: bpy.props.FloatProperty(
-        name="Projector Power",
+        name="Lumens",
         soft_min=0, soft_max=999999,
-        update=update_power,
-        unit='POWER')
+        update=update_power)
     resolution: bpy.props.EnumProperty(
         items=RESOLUTIONS,
         default='1920x1080',
@@ -3043,6 +3177,10 @@ class ProjectorSettings(bpy.types.PropertyGroup):
         min=0.2,
         subtype='DISTANCE',
         unit='LENGTH',
+        update=update_projection_cone)
+    projection_info_enabled: bpy.props.BoolProperty(
+        name='Show Screen Info',
+        default=False,
         update=update_projection_cone)
 
 
