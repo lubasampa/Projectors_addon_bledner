@@ -1089,6 +1089,8 @@ def _cone_length_meters(proj_settings, scene=None):
     # Older UI unit handling could store scene units while the add-on logic expected meters.
     if scale != 1.0 and value > 20.0:
         return _scene_units_to_meters(value, scene)
+    if value > 20.0:
+        return value / 100.0
     return value
 
 
@@ -1174,12 +1176,15 @@ def _apply_projection_info(projector, proj_settings, screen_width_units, screen_
         curve = bpy.data.curves.new('Projector.ConeInfo', type='FONT')
         info = bpy.data.objects.new('Projector.ConeInfo', curve)
         info[PROJECTOR_CONE_INFO_TAG] = True
-        info.parent = spot
+        info.parent = projector
         info.matrix_parent_inverse.identity()
         target_collection = projector.users_collection[0] if projector.users_collection else bpy.context.scene.collection
         target_collection.objects.link(info)
     else:
         curve = info.data
+        if info.parent != projector:
+            info.parent = projector
+            info.matrix_parent_inverse.identity()
 
     width_m, height_m, area_m2, lumens, lux = _projection_screen_metrics(projector, proj_settings)
     curve.body = (
@@ -1190,15 +1195,17 @@ def _apply_projection_info(projector, proj_settings, screen_width_units, screen_
     )
     curve.align_x = 'LEFT'
     curve.align_y = 'CENTER'
-    curve.size = max(min(screen_width_units * 0.18, _meters_to_scene_units(0.8)), _meters_to_scene_units(0.18))
+    curve.size = max(min(screen_width_units * 0.22, _meters_to_scene_units(1.2)), _meters_to_scene_units(0.35))
 
     margin = max(screen_width_units * 0.12, _meters_to_scene_units(0.25))
-    info.location = (
+    local_location = Vector((
         (screen_width_units * 0.5) + margin,
         screen_height_units * 0.25,
         -length_units,
-    )
-    info.rotation_euler = Euler((0.0, 0.0, 0.0), 'XYZ')
+    ))
+    info.location = Vector(spot.location) + (spot.rotation_euler.to_matrix() @ local_location)
+    info.rotation_euler = spot.rotation_euler.copy()
+    info.scale = (1.0, 1.0, 1.0)
     info.hide_render = False
     info.hide_viewport = False
     info.hide_select = True
