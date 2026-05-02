@@ -2959,7 +2959,101 @@ class PROJECTOR_OT_export_projection_cone(Operator):
         return {'FINISHED'}
 
 
-def _export_independent_cone_copy(cone, name, target_collection):
+def _copy_cone_material_for_export(source_material, name):
+    if source_material is None:
+        return None
+    mat = source_material.copy()
+    mat.name = name
+    return mat
+
+
+def _get_or_create_cone_edges_material():
+    mat = bpy.data.materials.get('_Projector.ConeEdgesMaterial')
+    if mat is None:
+        mat = bpy.data.materials.new('_Projector.ConeEdgesMaterial')
+    mat.diffuse_color = (0.02, 0.025, 0.03, 1.0)
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+
+    out = nodes.new('ShaderNodeOutputMaterial')
+    bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+    bsdf.inputs['Base Color'].default_value = (0.02, 0.025, 0.03, 1.0)
+    bsdf.inputs['Roughness'].default_value = 0.45
+    links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
+    return mat
+
+
+def _copy_cone_edges_material_for_export(name):
+    mat = _get_or_create_cone_edges_material().copy()
+    mat.name = name
+    return mat
+
+
+def _get_or_create_child_collection(parent_collection, name):
+    collection = bpy.data.collections.get(name)
+    if collection is None:
+        collection = bpy.data.collections.new(name)
+    if parent_collection is not None and not any(child.name == collection.name for child in parent_collection.children):
+        parent_collection.children.link(collection)
+    return collection
+
+
+def _create_exported_cone_edges(obj, target_collection, scene=None):
+    if obj is None or obj.data is None:
+        return None
+
+    curve = bpy.data.curves.new('Projector.ConeEdges', type='CURVE')
+    curve.dimensions = '3D'
+    curve.resolution_u = 1
+    curve.bevel_depth = 0.012
+    curve.bevel_resolution = 1
+
+    vertices = obj.data.vertices
+    for edge in obj.data.edges:
+        polyline = curve.splines.new('POLY')
+        polyline.points.add(1)
+        for point, vertex_index in zip(polyline.points, edge.vertices):
+            co = vertices[vertex_index].co
+            point.co = (co.x, co.y, co.z, 1.0)
+
+    edge_obj = bpy.data.objects.new(f'{obj.name}.ConeEdges', curve)
+    edge_obj.location = (0.0, 0.0, 0.0)
+    edge_obj.rotation_euler = (0.0, 0.0, 0.0)
+    edge_obj.scale = (1.0, 1.0, 1.0)
+
+    scene = scene or bpy.context.scene
+    collection_parent = scene.collection if scene is not None else None
+    edges_collection = _get_or_create_child_collection(collection_parent, 'Projector Cone Edges')
+    edges_collection.objects.link(edge_obj)
+    curve.materials.append(_copy_cone_edges_material_for_export(f'{edge_obj.name}.Material'))
+    return edge_obj
+
+
+def _assign_exported_cone_materials(obj, source_cone, randomize=False):
+    if obj is None or obj.data is None:
+        return
+
+    obj.data.materials.clear()
+    if randomize:
+        obj.data.materials.append(_create_random_cone_copy_material(f'{obj.name}.RandomMaterial'))
+        return
+
+    source_materials = source_cone.data.materials if source_cone and source_cone.data else []
+    for index, source_material in enumerate(source_materials):
+        material_name = f'{obj.name}.Material' if index == 0 else f'{obj.name}.Material.{index:03d}'
+        material = _copy_cone_material_for_export(source_material, material_name)
+        if material is not None:
+            obj.data.materials.append(material)
+
+    if not obj.data.materials:
+        obj.data.materials.append(_copy_cone_material_for_export(
+            _get_or_create_cone_material(),
+            f'{obj.name}.Material'))
+
+
+def _export_independent_cone_copy(cone, name, target_collection, randomize_material=False, scene=None):
     if cone is None or cone.data is None:
         return None
 
@@ -2973,6 +3067,8 @@ def _export_independent_cone_copy(cone, name, target_collection):
     if PROJECTOR_CONE_TAG in obj:
         del obj[PROJECTOR_CONE_TAG]
     target_collection.objects.link(obj)
+    _assign_exported_cone_materials(obj, cone, randomize=randomize_material)
+    _create_exported_cone_edges(obj, target_collection, scene=scene)
     return obj
 
 
@@ -3036,14 +3132,12 @@ class PROJECTOR_OT_export_all_projection_cones(Operator):
             if cone is None:
                 continue
             name = f'{projector.name}.ConeCopy'
-            exported = _export_independent_cone_copy(cone, name, target_collection)
+            exported = _export_independent_cone_copy(
+                cone,
+                name,
+                target_collection,
+                randomize_material=self.randomize_colors)
             if exported is not None:
-                if self.randomize_colors:
-                    mat = _create_random_cone_copy_material(f'{exported.name}.RandomMaterial')
-                    if exported.data.materials:
-                        exported.data.materials[0] = mat
-                    else:
-                        exported.data.materials.append(mat)
                 count += 1
 
         if count == 0:

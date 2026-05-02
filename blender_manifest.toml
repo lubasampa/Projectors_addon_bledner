@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "projector"
-version = "2026.4.30"
+version = "2026.5.2"
 name = "Projector"
 tagline = "Easy projector creation and modification for Blender"
 maintainer = "Jonas Schell"
