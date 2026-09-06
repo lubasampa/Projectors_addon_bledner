@@ -1,0 +1,31 @@
+name: Build Test Add-on Package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build installable add-on ZIP
+        run: python scripts/build_release.py
+
+      - name: Upload add-on package
+        uses: actions/upload-artifact@v4
+        with:
+          name: projector-test-package
+          path: builds/*.zip
+          if-no-files-found: error
+          retention-days: 14
