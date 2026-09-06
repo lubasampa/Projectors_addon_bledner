@@ -3,6 +3,8 @@ import math
 import os
 import json
 import uuid
+import base64
+import tempfile
 
 from enum import Enum
 import bpy
@@ -34,6 +36,7 @@ _PROJECTOR_DUPLICATE_HANDLER_RUNNING = False
 _PROJECTOR_DUPLICATE_REFRESH_PENDING = set()
 _PROJECTOR_DUPLICATE_REFRESH_SCHEDULED = False
 _PROJECTOR_ARRAY_SYNC_SCHEDULED = False
+_ADDON_KEYMAPS = []
 
 
 def _get_models_store_path():
@@ -88,6 +91,8 @@ def _serialize_models_from_preferences(prefs):
             'body_mesh_faces_json': preset.body_mesh_faces_json,
             'body_mesh_material_indices_json': preset.body_mesh_material_indices_json,
             'body_materials_json': preset.body_materials_json,
+            'body_asset_blend_b64': preset.body_asset_blend_b64,
+            'body_asset_object_name': preset.body_asset_object_name,
         })
     return models
 
@@ -194,6 +199,8 @@ def _populate_preferences_from_model_data(prefs, stored_models):
         preset.body_mesh_faces_json = str(data.get('body_mesh_faces_json', ''))
         preset.body_mesh_material_indices_json = str(data.get('body_mesh_material_indices_json', ''))
         preset.body_materials_json = str(data.get('body_materials_json', ''))
+        preset.body_asset_blend_b64 = str(data.get('body_asset_blend_b64', ''))
+        preset.body_asset_object_name = str(data.get('body_asset_object_name', ''))
     return True
 
 
@@ -552,6 +559,8 @@ class ProjectorModelPreset(PropertyGroup):
     body_mesh_faces_json: bpy.props.StringProperty(name='Body Mesh Faces', default='')
     body_mesh_material_indices_json: bpy.props.StringProperty(name='Body Mesh Material Indices', default='')
     body_materials_json: bpy.props.StringProperty(name='Body Materials', default='')
+    body_asset_blend_b64: bpy.props.StringProperty(name='Body Asset Snapshot', default='')
+    body_asset_object_name: bpy.props.StringProperty(name='Body Asset Object', default='')
 
 
 class PROJECTOR_AP_preferences(AddonPreferences):
@@ -822,6 +831,7 @@ def _ensure_default_body(projector):
     body.matrix_parent_inverse.identity()
     body.hide_render = False
     body.hide_viewport = False
+    body.hide_select = True
     body.display_type = 'SOLID'
     body.scale = (1.0, 1.0, 1.0)
     target_collection = projector.users_collection[0] if projector.users_collection else bpy.context.scene.collection
@@ -846,6 +856,7 @@ def _set_body_from_object(source_obj, projector):
     body.parent = projector
     body.matrix_parent_inverse.identity()
     body.location = projector.proj_settings.body_offset
+    body.hide_select = True
     target_collection = projector.users_collection[0] if projector.users_collection else bpy.context.scene.collection
     target_collection.objects.link(body)
     return body
@@ -922,6 +933,104 @@ def _serialize_body_materials(obj):
     return json.dumps(materials) if materials else ''
 
 
+def _body_texture_images(body):
+    """Return image textures used by the body's material node trees."""
+    images = {}
+    visited_trees = set()
+
+    def collect_images(node_tree):
+        if node_tree is None:
+            return
+        pointer = node_tree.as_pointer()
+        if pointer in visited_trees:
+            return
+        visited_trees.add(pointer)
+        for node in node_tree.nodes:
+            image = getattr(node, 'image', None)
+            if image is not None:
+                images[image.as_pointer()] = image
+            nested_tree = getattr(node, 'node_tree', None)
+            if nested_tree is not None:
+                collect_images(nested_tree)
+
+    if body is None:
+        return []
+    for slot in body.material_slots:
+        material = slot.material
+        if material is None or not material.use_nodes or material.node_tree is None:
+            continue
+        collect_images(material.node_tree)
+    return list(images.values())
+
+
+def _serialize_body_asset_snapshot(body):
+    """Embed a native Blender library containing the complete custom body.
+
+    The regular JSON fields are intentionally retained for compatibility. This
+    snapshot preserves Blender data that cannot be represented faithfully in
+    those fields, including UV layers, modifiers, shape keys, vertex groups,
+    material node trees and packed texture images.
+    """
+    if body is None or body.type != 'MESH':
+        return ''
+
+    packed_here = []
+    try:
+        # Pack only images that were external before writing the library, then
+        # restore their prior external state after the snapshot is created.
+        for image in _body_texture_images(body):
+            if image.packed_file is None:
+                try:
+                    image.pack()
+                    packed_here.append(image)
+                except RuntimeError:
+                    log.warning('Could not pack texture image %s for saved projector model.', image.name)
+
+        with tempfile.TemporaryDirectory(prefix='projector_model_') as directory:
+            filepath = os.path.join(directory, 'body_snapshot.blend')
+            bpy.data.libraries.write(filepath, {body}, path_remap='ABSOLUTE', compress=True)
+            with open(filepath, 'rb') as handle:
+                return base64.b64encode(handle.read()).decode('ascii')
+    except (OSError, RuntimeError):
+        log.exception('Failed to create complete body snapshot for saved projector model.')
+        return ''
+    finally:
+        for image in packed_here:
+            try:
+                image.unpack(method='USE_ORIGINAL')
+            except RuntimeError:
+                log.warning('Could not restore external state for texture image %s.', image.name)
+
+
+def _restore_body_from_asset_snapshot(projector, snapshot_b64, object_name=''):
+    """Append a body snapshot and parent it to *projector*."""
+    if not snapshot_b64:
+        return None
+    try:
+        payload = base64.b64decode(snapshot_b64.encode('ascii'), validate=True)
+        with tempfile.TemporaryDirectory(prefix='projector_model_') as directory:
+            filepath = os.path.join(directory, 'body_snapshot.blend')
+            with open(filepath, 'wb') as handle:
+                handle.write(payload)
+            with bpy.data.libraries.load(filepath, link=False) as (data_from, data_to):
+                names = data_from.objects
+                data_to.objects = [object_name] if object_name in names else list(names[:1])
+            body = next((obj for obj in data_to.objects if obj is not None), None)
+    except (OSError, RuntimeError, ValueError, base64.binascii.Error):
+        log.exception('Failed to restore complete body snapshot for saved projector model.')
+        return None
+
+    if body is None:
+        return None
+    body[PROJECTOR_BODY_TAG] = True
+    body.parent = projector
+    body.matrix_parent_inverse.identity()
+    body.hide_select = True
+    target_collection = projector.users_collection[0] if projector.users_collection else bpy.context.scene.collection
+    target_collection.objects.link(body)
+    return body
+
+
 def _apply_body_materials(obj, materials_json):
     if obj is None or obj.type != 'MESH' or obj.data is None:
         return
@@ -983,6 +1092,7 @@ def _create_body_from_mesh_data(projector, vertices_json, faces_json, material_i
     body.matrix_parent_inverse.identity()
     body.hide_render = False
     body.hide_viewport = False
+    body.hide_select = True
     body.display_type = 'SOLID'
     target_collection = projector.users_collection[0] if projector.users_collection else bpy.context.scene.collection
     target_collection.objects.link(body)
@@ -1024,6 +1134,7 @@ def _apply_body(projector, proj_settings):
         body.rotation_euler = Euler(proj_settings.body_rotation, 'XYZ')
         body.hide_render = False
         body.hide_viewport = False
+        body.hide_select = True
 
 
 def update_body(proj_settings, context):
@@ -1722,6 +1833,8 @@ def _model_data_from_preset(preset):
         'body_mesh_faces_json': preset.body_mesh_faces_json,
         'body_mesh_material_indices_json': preset.body_mesh_material_indices_json,
         'body_materials_json': preset.body_materials_json,
+        'body_asset_blend_b64': preset.body_asset_blend_b64,
+        'body_asset_object_name': preset.body_asset_object_name,
     }
 
 
@@ -1774,6 +1887,8 @@ def _store_model_preset_from_data(manufacturer, model_name, model_data):
     preset.body_mesh_faces_json = model_data.get('body_mesh_faces_json', '')
     preset.body_mesh_material_indices_json = model_data.get('body_mesh_material_indices_json', '')
     preset.body_materials_json = model_data.get('body_materials_json', '')
+    preset.body_asset_blend_b64 = model_data.get('body_asset_blend_b64', '')
+    preset.body_asset_object_name = model_data.get('body_asset_object_name', '')
     _write_models_store(prefs)
     return True
 
@@ -1895,49 +2010,12 @@ class PROJECTOR_OT_create_projector(Operator):
                 'body_mesh_faces_json': '',
                 'body_mesh_material_indices_json': '',
                 'body_materials_json': '',
+                'body_asset_blend_b64': '',
+                'body_asset_object_name': '',
             }
 
         _apply_model_to_projector(projector, model_data)
-
-        if model_data.get('body_mesh_vertices_json'):
-            existing_body = get_projector_body(projector)
-            if existing_body is not None:
-                old_mesh = existing_body.data
-                bpy.data.objects.remove(existing_body, do_unlink=True)
-                if old_mesh and old_mesh.users == 0:
-                    bpy.data.meshes.remove(old_mesh, do_unlink=True)
-            restored = _create_body_from_mesh_data(
-                projector,
-                model_data.get('body_mesh_vertices_json', ''),
-                model_data.get('body_mesh_faces_json', ''),
-                model_data.get('body_mesh_material_indices_json', ''),
-                model_data.get('body_materials_json', ''),
-            )
-            if restored is not None:
-                restored.location = Vector(model_data['body_offset'])
-                restored.rotation_euler = Euler(model_data.get('body_rotation', (0.0, 0.0, 0.0)), 'XYZ')
-                projector.proj_settings.body_type = 'SELECTED_OBJECT'
-            else:
-                _apply_body(projector, projector.proj_settings)
-        elif model_data['body_type'] == 'SELECTED_OBJECT':
-            try:
-                existing_body = get_projector_body(projector)
-                if existing_body is not None:
-                    old_mesh = existing_body.data
-                    bpy.data.objects.remove(existing_body, do_unlink=True)
-                    if old_mesh and old_mesh.users == 0:
-                        bpy.data.meshes.remove(old_mesh, do_unlink=True)
-                body = _set_body_from_object(source_body_obj, projector)
-                body.location = Vector(model_data['body_offset'])
-            except RuntimeError as exc:
-                self.report({'WARNING'}, f'{exc} Using default body instead.')
-                projector.proj_settings.body_type = 'DEFAULT_BOX'
-                _apply_body(projector, projector.proj_settings)
-        else:
-            _apply_body(projector, projector.proj_settings)
-
-        _apply_emitter_transform(projector, projector.proj_settings)
-        _apply_projection_cone(projector, projector.proj_settings)
+        _restore_body_from_model_data(projector, model_data, source_body_obj, self)
         if projector.proj_settings.body_type == 'DEFAULT_BOX' and get_projector_body(projector) is None:
             _ensure_default_body(projector)
             _apply_body(projector, projector.proj_settings)
@@ -1968,6 +2046,8 @@ def _model_data_from_settings(settings):
         'body_mesh_faces_json': '',
         'body_mesh_material_indices_json': '',
         'body_materials_json': '',
+        'body_asset_blend_b64': '',
+        'body_asset_object_name': '',
     }
 
 
@@ -1997,6 +2077,8 @@ def _model_data_from_projector(projector):
         data['body_mesh_faces_json'] = faces_json
         data['body_mesh_material_indices_json'] = material_indices_json
         data['body_materials_json'] = _serialize_body_materials(body)
+        data['body_asset_blend_b64'] = _serialize_body_asset_snapshot(body)
+        data['body_asset_object_name'] = body.name
 
     return data
 
@@ -2722,7 +2804,22 @@ class PROJECTOR_OT_make_array_independent(Operator):
 
 
 def _restore_body_from_model_data(projector, model_data, source_body_obj=None, operator=None):
-    if model_data.get('body_mesh_vertices_json'):
+    existing_body = get_projector_body(projector)
+    if model_data.get('body_asset_blend_b64'):
+        if existing_body is not None:
+            bpy.data.objects.remove(existing_body, do_unlink=True)
+        restored = _restore_body_from_asset_snapshot(
+            projector,
+            model_data['body_asset_blend_b64'],
+            model_data.get('body_asset_object_name', ''))
+        if restored is not None:
+            restored.location = Vector(model_data['body_offset'])
+            restored.rotation_euler = Euler(
+                model_data.get('body_rotation', (0.0, 0.0, 0.0)), 'XYZ')
+            projector.proj_settings.body_type = 'SELECTED_OBJECT'
+        else:
+            _apply_body(projector, projector.proj_settings)
+    elif model_data.get('body_mesh_vertices_json'):
         existing_body = get_projector_body(projector)
         if existing_body is not None:
             old_mesh = existing_body.data
@@ -3182,6 +3279,59 @@ def update_projected_texture(proj_settings, context):
     _apply_projected_texture_to_projector(get_projector(context), proj_settings)
 
 
+def _projector_ancestor(obj):
+    while obj is not None:
+        if obj.type == 'CAMERA' and obj.name.startswith('Projector'):
+            return obj
+        obj = obj.parent
+    return None
+
+
+class PROJECTOR_OT_smart_delete(Operator):
+    """Delete projectors as complete hierarchies, otherwise use Blender delete."""
+    bl_idname = 'projector.smart_delete'
+    bl_label = 'Delete Projector or Selected Objects'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and bool(context.selected_objects)
+
+    def _selected_projectors(self, context):
+        projectors = {}
+        for obj in context.selected_objects:
+            projector = _projector_ancestor(obj)
+            if projector is not None:
+                projectors[projector.as_pointer()] = projector
+        return list(projectors.values())
+
+    def invoke(self, context, event):
+        # Keep Blender's regular confirmation and deletion behavior intact when
+        # no projector is involved in the selection.
+        if not self._selected_projectors(context):
+            return bpy.ops.object.delete('INVOKE_DEFAULT')
+        return self.execute(context)
+
+    def execute(self, context):
+        projectors = self._selected_projectors(context)
+        if not projectors:
+            return bpy.ops.object.delete('EXEC_DEFAULT')
+
+        for projector in projectors:
+            if projector.name in bpy.data.objects:
+                _remove_projector_hierarchy(projector)
+
+        # A mixed selection must still delete ordinary selected objects using
+        # Blender's standard operator after the projector hierarchies are gone.
+        remaining = [
+            obj for obj in context.selected_objects
+            if obj.name in bpy.data.objects
+        ]
+        if remaining:
+            bpy.ops.object.delete('EXEC_DEFAULT')
+        return {'FINISHED'}
+
+
 class PROJECTOR_OT_delete_projector(Operator):
     """Delete Projector"""
     bl_idname = 'projector.delete'
@@ -3328,6 +3478,7 @@ def register():
     _safe_register_class(PROJECTOR_OT_delete_saved_model)
     _safe_register_class(PROJECTOR_OT_export_projection_cone)
     _safe_register_class(PROJECTOR_OT_export_all_projection_cones)
+    _safe_register_class(PROJECTOR_OT_smart_delete)
     _safe_register_class(PROJECTOR_OT_delete_projector)
     _safe_register_class(PROJECTOR_OT_change_color_randomly)
     _load_models_store_into_preferences()
@@ -3336,14 +3487,30 @@ def register():
     if _ensure_duplicated_projectors_are_independent not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_ensure_duplicated_projectors_are_independent)
 
+    keyconfig = bpy.context.window_manager.keyconfigs.addon
+    if keyconfig is not None:
+        keymap = keyconfig.keymaps.new(name='Object Mode', space_type='EMPTY')
+        for key_type in ('X', 'DEL'):
+            try:
+                item = keymap.keymap_items.new(
+                    PROJECTOR_OT_smart_delete.bl_idname, key_type, 'PRESS', head=True)
+            except TypeError:
+                item = keymap.keymap_items.new(
+                    PROJECTOR_OT_smart_delete.bl_idname, key_type, 'PRESS')
+            _ADDON_KEYMAPS.append((keymap, item))
+
 
 def unregister():
+    for keymap, item in _ADDON_KEYMAPS:
+        keymap.keymap_items.remove(item)
+    _ADDON_KEYMAPS.clear()
     if _ensure_duplicated_projectors_are_independent in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_ensure_duplicated_projectors_are_independent)
     if hasattr(bpy.types.Object, 'proj_settings'):
         del bpy.types.Object.proj_settings
     _safe_unregister_class(PROJECTOR_OT_change_color_randomly)
     _safe_unregister_class(PROJECTOR_OT_delete_projector)
+    _safe_unregister_class(PROJECTOR_OT_smart_delete)
     _safe_unregister_class(PROJECTOR_OT_delete_saved_model)
     _safe_unregister_class(PROJECTOR_OT_import_saved_models)
     _safe_unregister_class(PROJECTOR_OT_export_saved_models)
