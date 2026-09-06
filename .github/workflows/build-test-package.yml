@@ -22,10 +22,16 @@ jobs:
       - name: Build installable add-on ZIP
         run: python scripts/build_release.py
 
+      - name: Prepare directly installable artifact
+        run: |
+          mkdir -p artifact
+          unzip -q builds/*.zip -d artifact
+          test -f artifact/blender_manifest.toml
+
       - name: Upload add-on package
         uses: actions/upload-artifact@v4
         with:
           name: projector-test-package
-          path: builds/*.zip
+          path: artifact/
           if-no-files-found: error
           retention-days: 14
